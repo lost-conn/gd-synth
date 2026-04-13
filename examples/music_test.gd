@@ -20,11 +20,8 @@ extends Node
 
 @onready var synth: SynthEngine = $SynthEngine
 @onready var midi_player: MidiPlayer = $MidiPlayer
+@onready var editor: PanelContainer = $EditorLayer/EditorScroll/PatchEditor
 
-const PatchEditorScript := preload("res://addons/godot_synth/editor/patch_editor.gd")
-
-var editor: PanelContainer
-var _editor_canvas: CanvasLayer
 var _director: MusicDirector
 
 const KEY_TO_SEMITONE := {
@@ -58,13 +55,8 @@ func _ready() -> void:
 	if midi_path != "":
 		midi_player.load_midi(midi_path)
 
-	_editor_canvas = CanvasLayer.new()
-	add_child(_editor_canvas)
-	editor = PatchEditorScript.new()
 	editor.synth = synth
 	editor.patch_changed.connect(_on_editor_patch_changed)
-	_editor_canvas.add_child(editor)
-	editor.position = Vector2(20, 20)
 	editor.set_patch(patch)
 
 	_setup_music_demo()
@@ -123,7 +115,8 @@ func _handle_key(event: InputEventKey) -> void:
 		KEY_8:
 			editor.set_patch(SynthPatch.make_hihat())
 		KEY_F1:
-			editor.visible = not editor.visible
+			var scroll := editor.get_parent()
+			scroll.visible = not scroll.visible
 		KEY_F2:
 			_toggle_music_demo()
 		KEY_SPACE:
