@@ -9,9 +9,22 @@ extends Node
 # at the cost of CPU. Each voice uses a precomputed wavetable from its patch
 # (see SynthPatch) so there are no per-sample sin() calls in the hot path.
 
+## Audio sample rate (Hz). 22050 is plenty for game music and costs half the
+## CPU of 44100. Higher rates reduce aliasing on bright/saw timbres.
+## Cannot be changed after [method _ready].
 @export var mix_rate: float = 22050.0
+
+## AudioStreamGenerator buffer length in seconds. Shorter = lower latency but
+## higher risk of underruns if a frame stalls. 0.05 is a good default.
 @export var buffer_length: float = 0.05
+
+## Voice pool size. When all voices are active, [method note_on] steals the
+## oldest voice. Raise for dense polyphony (chords + arpeggios + drums);
+## lower to cap CPU on slower machines.
 @export var max_voices: int = 24
+
+## Final output level applied after summing all voices. Use for fade in/out
+## via tween. Voices are clipped to [-1, 1] after this multiplication.
 @export_range(0.0, 1.0) var master_gain: float = 0.6
 
 const ENV_ATTACK := 0

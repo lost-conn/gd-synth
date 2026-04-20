@@ -5,14 +5,24 @@ extends Node
 # wall-clock time and dispatches every event whose timestamp has passed.
 # Channels 0..15 each address one slot in SynthEngine's patch table.
 
+## Path to a Standard MIDI File (.mid). Loaded in [method _ready] if set.
 @export_file("*.mid") var midi_path: String = ""
+
+## Target SynthEngine for note events. Required — the player does nothing
+## without one.
 @export var synth: SynthEngine
+
+## Begin playback automatically when the node enters the scene tree.
 @export var autoplay: bool = false
+
+## Restart the file from the beginning when it finishes, releasing any
+## sustaining notes first.
 @export var loop: bool = false
 
-# Optional per-channel patches assigned in the editor (or via code with
-# set_patch). Channel index = array index. Null entries leave the synth's
-# default patch in place.
+## Per-channel patch assignments (0..15). Array index = MIDI channel.
+## Null entries leave the synth's default patch in place. For a drum kit
+## on channel 10 (index 9), assign kick/snare/hihat patches on adjacent
+## channels and map MIDI drum notes in your source file accordingly.
 @export var channel_patches: Array[SynthPatch] = []
 
 var midi: MidiFile

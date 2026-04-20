@@ -7,58 +7,95 @@ extends Resource
 
 enum Waveform { ADDITIVE, SINE, SQUARE, SAW, TRIANGLE }
 
+## Human-readable label for this patch. Shown in the patch editor UI and
+## used as the default filename when saving.
 @export var patch_name: String = "Patch"
 
+@export_group("Oscillator")
+
+## Base waveform. ADDITIVE uses the [member harmonics] array; the others
+## are fixed analytic shapes (sine, square, saw, triangle). Changing this
+## at runtime rebuilds the wavetable automatically.
 @export var waveform: Waveform = Waveform.ADDITIVE:
 	set(value):
 		waveform = value
 		if _table.size() == TABLE_SIZE:
 			rebuild()
 
-# Amplitudes per harmonic. Index 0 = fundamental, index 1 = 2nd partial, etc.
-# Setter rebuilds the wavetable so live edits and loaded resources both
-# refresh automatically.
+## Amplitudes per harmonic partial when [member waveform] is ADDITIVE.
+## Index 0 = fundamental, 1 = 2nd partial, etc. Values are summed as sine
+## waves at integer multiples of the fundamental (or [member harmonic_ratios]
+## if provided) and normalized to peak 1.0. Setter rebuilds the wavetable.
 @export var harmonics: PackedFloat32Array = PackedFloat32Array([1.0, 0.5, 0.25, 0.125]):
 	set(value):
 		harmonics = value
 		if _table.size() == TABLE_SIZE:
 			rebuild()
 
-# Optional inharmonic ratios per partial. Zero or missing entries fall back
-# to integer multiples (1, 2, 3, ...). Use this for bell-like timbres.
+## Optional inharmonic frequency ratios per partial (parallel to [member harmonics]).
+## Zero or missing entries fall back to integer multiples (1, 2, 3, ...).
+## Use e.g. [1.0, 2.76, 5.4, 8.93] for bell-like FM ratios.
 @export var harmonic_ratios: PackedFloat32Array = PackedFloat32Array():
 	set(value):
 		harmonic_ratios = value
 		if _table.size() == TABLE_SIZE:
 			rebuild()
 
-# ADSR in seconds; sustain is 0..1 level.
+@export_group("Envelope (ADSR)")
+
+## Seconds to ramp from silence to peak amplitude after note-on.
 @export var attack: float = 0.01
+
+## Seconds to decay from peak to [member sustain] level.
 @export var decay: float = 0.10
+
+## Held amplitude level (0..1) while the note is active. Reached after decay.
 @export_range(0.0, 1.0) var sustain: float = 0.7
+
+## Seconds to fade to silence after note-off.
 @export var release: float = 0.20
 
-# One-pole lowpass cutoff coefficient. 1.0 disables the filter.
+@export_group("Filter & Gain")
+
+## One-pole lowpass cutoff coefficient. 1.0 = pass-through (no filter);
+## lower values muffle high frequencies. Cheap but effective.
 @export_range(0.0, 1.0) var lowpass: float = 1.0
 
+## Per-patch output level. Stacks with [SynthEngine.master_gain].
 @export var gain: float = 0.5
 
-# Stack N detuned voices per note for chorus / unison fatness.
+@export_group("Unison / Detune")
+
+## Stack N detuned copies of the oscillator per note for chorus / fatness.
+## 1 = single voice (cheapest). Higher values cost proportionally more CPU.
 @export_range(1, 4) var detune_voices: int = 1
+
+## Maximum spread between stacked voices, in cents (1 cent = 1/100 semitone).
+## Voices are distributed linearly from -detune_cents to +detune_cents.
 @export var detune_cents: float = 6.0
 
-# LFO pitch modulation.
-@export var vibrato_rate: float = 0.0      # Hz
+@export_group("Vibrato")
+
+## Vibrato LFO rate in Hz. 0 disables vibrato.
+@export var vibrato_rate: float = 0.0
+
+## Vibrato pitch-modulation depth in cents. 100 cents = one semitone.
 @export var vibrato_depth_cents: float = 0.0
 
-# Noise mix: 0 = pure oscillator, 1 = pure white noise. Essential for
-# snare, hi-hat, and cymbal patches.
+@export_group("Drum / Percussion")
+
+## Blend between the oscillator (0) and white noise (1). Essential for
+## snare, hi-hat, and cymbal patches. Set to 1 for pure noise.
 @export_range(0.0, 1.0) var noise_mix: float = 0.0
 
-# Pitch envelope: pitch starts this many semitones above the MIDI note
-# and decays to the note frequency over pitch_decay_time seconds.
-# Used for kick drums and tom-like sounds.
+## Pitch envelope amount in semitones. On note-on the pitch starts this
+## many semitones above the MIDI note and falls to the note over
+## [member pitch_decay_time]. Used for kick drums (~48 semi) and toms.
+## 0 disables the pitch envelope.
 @export var pitch_decay_semitones: float = 0.0
+
+## Duration (seconds) for the pitch envelope to reach the target note.
+## Short values (~0.05-0.1s) give the characteristic kick "thump."
 @export var pitch_decay_time: float = 0.0
 
 const TABLE_SIZE: int = 2048

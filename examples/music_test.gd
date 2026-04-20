@@ -151,27 +151,27 @@ func _setup_music_demo() -> void:
 	var music := MusicData.new()
 	music.bpm = 110.0
 	music.blocks = [
-		MusicData.MusicBlock.create(MusicData.C, MusicData.CHORD_MAJ, MusicData.C, MusicData.MAJOR, 4),
-		MusicData.MusicBlock.create(MusicData.G, MusicData.CHORD_MAJ, MusicData.C, MusicData.MAJOR, 4),
-		MusicData.MusicBlock.create(MusicData.A, MusicData.CHORD_MIN, MusicData.C, MusicData.MAJOR, 4),
-		MusicData.MusicBlock.create(MusicData.F, MusicData.CHORD_MAJ, MusicData.C, MusicData.MAJOR, 4),
+		MusicBlock.create(MusicData.C, MusicData.CHORD_MAJ, MusicData.C, MusicData.MAJOR, 4),
+		MusicBlock.create(MusicData.G, MusicData.CHORD_MAJ, MusicData.C, MusicData.MAJOR, 4),
+		MusicBlock.create(MusicData.A, MusicData.CHORD_MIN, MusicData.C, MusicData.MAJOR, 4),
+		MusicBlock.create(MusicData.F, MusicData.CHORD_MAJ, MusicData.C, MusicData.MAJOR, 4),
 	]
 	_director.data = music
 
 	# --- Chord arpeggio (ch 1) ------------------------------------------
-	var arp_pat := MusicData.MusicPattern.new()
+	var arp_pat := MusicPattern.new()
 	arp_pat.length_beats = 2.0
 	arp_pat.add(0.0, 0.45, 0).add(0.5, 0.45, 1).add(1.0, 0.45, 2).add(1.5, 0.45, 1)
 	_add_track("ChordArp", MusicTrack.TrackType.CHORD, 1, SynthPatch.make_organ(), arp_pat, 4)
 
 	# --- Bass (ch 2) — root notes, low octave ---------------------------
-	var bass_pat := MusicData.MusicPattern.new()
+	var bass_pat := MusicPattern.new()
 	bass_pat.length_beats = 4.0
 	bass_pat.add(0.0, 0.9, 0).add(2.0, 0.9, 0)
 	_add_track("Bass", MusicTrack.TrackType.CHORD, 2, SynthPatch.make_bass(), bass_pat, 2)
 
 	# --- Melody (ch 3) — scale degrees ----------------------------------
-	var mel_pat := MusicData.MusicPattern.new()
+	var mel_pat := MusicPattern.new()
 	mel_pat.length_beats = 8.0
 	mel_pat.add(0.0, 0.5, 4, 0, 0, 0.7)
 	mel_pat.add(0.5, 0.5, 3, 0, 0, 0.6)
@@ -186,26 +186,26 @@ func _setup_music_demo() -> void:
 	_add_track("Melody", MusicTrack.TrackType.MELODY, 3, SynthPatch.make_clarinet(), mel_pat, 5)
 
 	# --- Kick (ch 9) ----------------------------------------------------
-	var kick_pat := MusicData.MusicPattern.new()
+	var kick_pat := MusicPattern.new()
 	kick_pat.length_beats = 2.0
 	kick_pat.add(0.0, 0.1, 36, 0, 0, 0.9)
 	kick_pat.add(1.0, 0.1, 36, 0, 0, 0.85)
 	_add_track("Kick", MusicTrack.TrackType.DRUM, 9, SynthPatch.make_kick(), kick_pat, 4)
 
 	# --- Snare (ch 10) — backbeats --------------------------------------
-	var snare_pat := MusicData.MusicPattern.new()
+	var snare_pat := MusicPattern.new()
 	snare_pat.length_beats = 2.0
 	snare_pat.add(1.0, 0.1, 38, 0, 0, 0.75)
 	_add_track("Snare", MusicTrack.TrackType.DRUM, 10, SynthPatch.make_snare(), snare_pat, 4)
 
 	# --- Hi-hat (ch 11) — 8th notes ------------------------------------
-	var hh_pat := MusicData.MusicPattern.new()
+	var hh_pat := MusicPattern.new()
 	hh_pat.length_beats = 1.0
 	hh_pat.add(0.0, 0.05, 42, 0, 0, 0.5)
 	hh_pat.add(0.5, 0.05, 42, 0, 0, 0.35)
 	_add_track("HiHat", MusicTrack.TrackType.DRUM, 11, SynthPatch.make_hihat(), hh_pat, 4)
 
-func _add_track(p_name: String, type: MusicTrack.TrackType, channel: int, p_patch: SynthPatch, pattern: MusicData.MusicPattern, oct: int) -> void:
+func _add_track(p_name: String, type: MusicTrack.TrackType, channel: int, p_patch: SynthPatch, pattern: MusicPattern, oct: int) -> void:
 	var t := MusicTrack.new()
 	t.name = p_name
 	t.track_type = type
