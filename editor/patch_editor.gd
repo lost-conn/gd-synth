@@ -23,6 +23,7 @@ var _harm_sliders: Array[VSlider] = []
 var _ratio_spins: Array[SpinBox] = []
 var _param_sliders: Dictionary = {}   # prop -> {"slider": HSlider, "label": Label}
 var _param_spins: Dictionary = {}     # prop -> SpinBox
+var _param_options: Dictionary = {}   # prop -> OptionButton
 var _save_dialog: FileDialog
 var _load_dialog: FileDialog
 var _suppress: bool = false
@@ -109,18 +110,33 @@ func _build_waveform_row(parent: VBoxContainer) -> void:
 	row.add_child(_waveform_option)
 
 func _build_preset_row(parent: VBoxContainer) -> void:
-	var row := HBoxContainer.new()
-	parent.add_child(row)
-	row.add_child(_label("Preset:"))
-	_add_preset(row, "Organ", func(): return SynthPatch.make_organ())
-	_add_preset(row, "Clarinet", func(): return SynthPatch.make_clarinet())
-	_add_preset(row, "Bell", func(): return SynthPatch.make_bell())
-	_add_preset(row, "Pad", func(): return SynthPatch.make_pad())
-	_add_preset(row, "Bass", func(): return SynthPatch.make_bass())
-	row.add_child(VSeparator.new())
-	_add_preset(row, "Kick", func(): return SynthPatch.make_kick())
-	_add_preset(row, "Snare", func(): return SynthPatch.make_snare())
-	_add_preset(row, "Hi-Hat", func(): return SynthPatch.make_hihat())
+	var row1 := HBoxContainer.new()
+	parent.add_child(row1)
+	row1.add_child(_label("Preset:"))
+	_add_preset(row1, "Organ", func(): return SynthPatch.make_organ())
+	_add_preset(row1, "Clarinet", func(): return SynthPatch.make_clarinet())
+	_add_preset(row1, "Bell", func(): return SynthPatch.make_bell())
+	_add_preset(row1, "Pad", func(): return SynthPatch.make_pad())
+	_add_preset(row1, "Bass", func(): return SynthPatch.make_bass())
+	row1.add_child(VSeparator.new())
+	_add_preset(row1, "Kick", func(): return SynthPatch.make_kick())
+	_add_preset(row1, "Snare", func(): return SynthPatch.make_snare())
+	_add_preset(row1, "Hi-Hat", func(): return SynthPatch.make_hihat())
+
+	var row2 := HBoxContainer.new()
+	parent.add_child(row2)
+	row2.add_child(_label("     "))
+	_add_preset(row2, "FM Bell", func(): return SynthPatch.make_fm_bell())
+	_add_preset(row2, "FM EPiano", func(): return SynthPatch.make_fm_epiano())
+	_add_preset(row2, "FM Clang", func(): return SynthPatch.make_fm_clang())
+	row2.add_child(VSeparator.new())
+	_add_preset(row2, "Acid", func(): return SynthPatch.make_acid_bass())
+	_add_preset(row2, "Pluck", func(): return SynthPatch.make_filter_pluck())
+	_add_preset(row2, "Sweep", func(): return SynthPatch.make_sweep_sfx())
+	row2.add_child(VSeparator.new())
+	_add_preset(row2, "Snare+", func(): return SynthPatch.make_snare_snappy())
+	_add_preset(row2, "Hat Open", func(): return SynthPatch.make_hihat_open())
+	_add_preset(row2, "Crash", func(): return SynthPatch.make_cymbal_crash())
 
 func _add_preset(parent: Control, label: String, maker: Callable) -> void:
 	var b := Button.new()
@@ -172,17 +188,42 @@ func _build_params(parent: VBoxContainer) -> void:
 	grid.add_theme_constant_override("v_separation", 4)
 	parent.add_child(grid)
 
+	# Envelope
 	_add_slider_row(grid, "attack", "Attack (s)", 0.0, 3.0, 0.001)
 	_add_slider_row(grid, "decay", "Decay (s)", 0.0, 3.0, 0.001)
 	_add_slider_row(grid, "sustain", "Sustain", 0.0, 1.0, 0.01)
 	_add_slider_row(grid, "release", "Release (s)", 0.0, 3.0, 0.001)
-	_add_slider_row(grid, "lowpass", "Lowpass", 0.0, 1.0, 0.01)
+	# Gain / legacy LP
+	_add_slider_row(grid, "lowpass", "Lowpass (legacy)", 0.0, 1.0, 0.01)
 	_add_slider_row(grid, "gain", "Gain", 0.0, 1.0, 0.01)
+	# Unison
 	_add_int_spin_row(grid, "detune_voices", "Detune voices", 1, 4)
 	_add_slider_row(grid, "detune_cents", "Detune cents", 0.0, 50.0, 0.1)
+	# Vibrato
 	_add_slider_row(grid, "vibrato_rate", "Vibrato rate (Hz)", 0.0, 15.0, 0.1)
 	_add_slider_row(grid, "vibrato_depth_cents", "Vibrato depth (cents)", 0.0, 50.0, 0.1)
+	# FM
+	_add_slider_row(grid, "fm_ratio", "FM ratio", 0.0, 16.0, 0.01)
+	_add_slider_row(grid, "fm_index", "FM index", 0.0, 8.0, 0.01)
+	# Resonant filter
+	_add_option_row(grid, "filter_type", "Filter type", [
+		["Off", SynthPatch.FilterType.OFF],
+		["Lowpass", SynthPatch.FilterType.LOWPASS],
+		["Highpass", SynthPatch.FilterType.HIGHPASS],
+		["Bandpass", SynthPatch.FilterType.BANDPASS],
+	])
+	_add_slider_row(grid, "filter_cutoff", "Filter cutoff", 0.0, 1.0, 0.01)
+	_add_slider_row(grid, "filter_resonance", "Filter resonance", 0.0, 1.0, 0.01)
+	_add_slider_row(grid, "filter_env_amount", "Filter env amount", -1.0, 1.0, 0.01)
+	_add_slider_row(grid, "filter_attack", "Filter attack (s)", 0.0, 3.0, 0.001)
+	_add_slider_row(grid, "filter_decay", "Filter decay (s)", 0.0, 3.0, 0.001)
+	_add_slider_row(grid, "filter_sustain", "Filter sustain", 0.0, 1.0, 0.01)
+	_add_slider_row(grid, "filter_release", "Filter release (s)", 0.0, 3.0, 0.001)
+	# Drum / noise
 	_add_slider_row(grid, "noise_mix", "Noise mix", 0.0, 1.0, 0.01)
+	_add_slider_row(grid, "noise_decay", "Noise decay (s)", 0.0, 3.0, 0.001)
+	_add_slider_row(grid, "noise_lowpass", "Noise lowpass", 0.0, 1.0, 0.01)
+	_add_slider_row(grid, "noise_highpass", "Noise highpass", 0.0, 1.0, 0.01)
 	_add_slider_row(grid, "pitch_decay_semitones", "Pitch decay (semi)", 0.0, 96.0, 0.5)
 	_add_slider_row(grid, "pitch_decay_time", "Pitch decay time (s)", 0.0, 1.0, 0.001)
 
@@ -212,6 +253,15 @@ func _add_int_spin_row(grid: GridContainer, prop: String, label: String, mn: int
 	sp.value_changed.connect(_on_param_spin.bind(prop))
 	grid.add_child(sp)
 	_param_spins[prop] = sp
+
+func _add_option_row(grid: GridContainer, prop: String, label: String, items: Array) -> void:
+	grid.add_child(_label(label))
+	var opt := OptionButton.new()
+	for item in items:
+		opt.add_item(item[0], item[1])
+	opt.item_selected.connect(_on_param_option.bind(prop, opt))
+	grid.add_child(opt)
+	_param_options[prop] = opt
 
 func _build_test_row(parent: VBoxContainer) -> void:
 	var row := HBoxContainer.new()
@@ -280,6 +330,13 @@ func _refresh_from_patch() -> void:
 	for prop in _param_spins.keys():
 		var sp: SpinBox = _param_spins[prop]
 		sp.value = float(patch.get(prop))
+	for prop in _param_options.keys():
+		var opt: OptionButton = _param_options[prop]
+		var target_id: int = int(patch.get(prop))
+		for idx in opt.item_count:
+			if opt.get_item_id(idx) == target_id:
+				opt.select(idx)
+				break
 	_path_label.text = current_path if current_path != "" else "(unsaved)"
 	_suppress = false
 
@@ -331,6 +388,11 @@ func _on_param_spin(value: float, prop: String) -> void:
 	if _suppress or patch == null:
 		return
 	patch.set(prop, int(value))
+
+func _on_param_option(idx: int, prop: String, opt: OptionButton) -> void:
+	if _suppress or patch == null:
+		return
+	patch.set(prop, opt.get_item_id(idx))
 
 # ---------------------------------------------------------------------------
 # New / Load / Save

@@ -6,6 +6,7 @@ extends Resource
 # lookup instead of N sin() calls.
 
 enum Waveform { ADDITIVE, SINE, SQUARE, SAW, TRIANGLE }
+enum FilterType { OFF, LOWPASS, HIGHPASS, BANDPASS }
 
 ## Human-readable label for this patch. Shown in the patch editor UI and
 ## used as the default filename when saving.
@@ -82,11 +83,67 @@ enum Waveform { ADDITIVE, SINE, SQUARE, SAW, TRIANGLE }
 ## Vibrato pitch-modulation depth in cents. 100 cents = one semitone.
 @export var vibrato_depth_cents: float = 0.0
 
+@export_group("FM")
+
+## Modulator frequency as a ratio of the carrier (1.0 = same freq,
+## 2.0 = octave above, 0.5 = octave below). Non-integer ratios give
+## inharmonic / bell-like timbres.
+@export var fm_ratio: float = 1.0
+
+## Modulation index — how much the modulator bends the carrier's phase.
+## 0 disables FM entirely (zero CPU cost). 0.1-0.3 = subtle warmth,
+## 0.5-2.0 = clear FM character, 3.0+ = noisy/metallic.
+@export var fm_index: float = 0.0
+
+@export_group("Resonant Filter")
+
+## Filter type for the second-stage state-variable filter. OFF bypasses
+## it entirely (no CPU cost). LOWPASS/HIGHPASS/BANDPASS enable it with
+## resonance and optional envelope modulation.
+@export var filter_type: FilterType = FilterType.OFF
+
+## Base cutoff frequency, normalized 0..1 (log-mapped to ~20 Hz..~10 kHz).
+## The effective cutoff is this plus [member filter_env_amount] * env.
+@export_range(0.0, 1.0) var filter_cutoff: float = 0.7
+
+## Filter resonance / Q. 0 = gentle slope, 1 = self-oscillating edge.
+## High values can clip; reduce [member gain] accordingly.
+@export_range(0.0, 1.0) var filter_resonance: float = 0.0
+
+## Envelope-to-cutoff modulation amount. Positive values open the filter
+## on note-on; negative values close it. Scaled so ±1 = full range.
+@export_range(-1.0, 1.0) var filter_env_amount: float = 0.0
+
+## Filter envelope attack time in seconds.
+@export var filter_attack: float = 0.01
+
+## Filter envelope decay time in seconds.
+@export var filter_decay: float = 0.10
+
+## Filter envelope sustain level (0..1).
+@export_range(0.0, 1.0) var filter_sustain: float = 0.5
+
+## Filter envelope release time in seconds.
+@export var filter_release: float = 0.20
+
 @export_group("Drum / Percussion")
 
 ## Blend between the oscillator (0) and white noise (1). Essential for
 ## snare, hi-hat, and cymbal patches. Set to 1 for pure noise.
 @export_range(0.0, 1.0) var noise_mix: float = 0.0
+
+## Independent noise decay in seconds. When > 0, noise fades out
+## exponentially on its own clock (snappy drum transient over sustained
+## body). When 0, noise follows the amp envelope (legacy behavior).
+@export var noise_decay: float = 0.0
+
+## One-pole lowpass applied only to the noise source before it's mixed
+## with the oscillator. 1.0 = no filter; lower values muffle (dull hat).
+@export_range(0.0, 1.0) var noise_lowpass: float = 1.0
+
+## One-pole highpass applied only to the noise source. 0.0 = no filter;
+## higher values remove rumble (crisp hi-hat, ride shimmer).
+@export_range(0.0, 1.0) var noise_highpass: float = 0.0
 
 ## Pitch envelope amount in semitones. On note-on the pitch starts this
 ## many semitones above the MIDI note and falls to the note over
@@ -263,5 +320,161 @@ static func make_hihat() -> SynthPatch:
 	p.release = 0.03
 	p.lowpass = 0.7
 	p.gain = 0.35
+	p.rebuild()
+	return p
+
+# --- FM presets -------------------------------------------------------------
+
+static func make_fm_bell() -> SynthPatch:
+	var p := SynthPatch.new()
+	p.patch_name = "FM Bell"
+	p.waveform = Waveform.SINE
+	p.fm_ratio = 3.5
+	p.fm_index = 1.4
+	p.attack = 0.001
+	p.decay = 1.8
+	p.sustain = 0.0
+	p.release = 0.8
+	p.gain = 0.4
+	p.rebuild()
+	return p
+
+static func make_fm_epiano() -> SynthPatch:
+	var p := SynthPatch.new()
+	p.patch_name = "FM EPiano"
+	p.waveform = Waveform.SINE
+	p.fm_ratio = 14.0
+	p.fm_index = 0.35
+	p.attack = 0.002
+	p.decay = 0.6
+	p.sustain = 0.35
+	p.release = 0.4
+	p.gain = 0.45
+	p.rebuild()
+	return p
+
+static func make_fm_clang() -> SynthPatch:
+	var p := SynthPatch.new()
+	p.patch_name = "FM Clang"
+	p.waveform = Waveform.SINE
+	p.fm_ratio = 2.47
+	p.fm_index = 3.0
+	p.attack = 0.001
+	p.decay = 0.5
+	p.sustain = 0.0
+	p.release = 0.2
+	p.pitch_decay_semitones = 18.0
+	p.pitch_decay_time = 0.06
+	p.gain = 0.35
+	p.rebuild()
+	return p
+
+# --- Resonant-filter presets -----------------------------------------------
+
+static func make_acid_bass() -> SynthPatch:
+	var p := SynthPatch.new()
+	p.patch_name = "Acid Bass"
+	p.waveform = Waveform.SAW
+	p.attack = 0.002
+	p.decay = 0.15
+	p.sustain = 0.5
+	p.release = 0.08
+	p.filter_type = FilterType.LOWPASS
+	p.filter_cutoff = 0.28
+	p.filter_resonance = 0.82
+	p.filter_env_amount = 0.55
+	p.filter_attack = 0.005
+	p.filter_decay = 0.25
+	p.filter_sustain = 0.0
+	p.filter_release = 0.15
+	p.gain = 0.45
+	p.rebuild()
+	return p
+
+static func make_filter_pluck() -> SynthPatch:
+	var p := SynthPatch.new()
+	p.patch_name = "Filter Pluck"
+	p.waveform = Waveform.SQUARE
+	p.attack = 0.001
+	p.decay = 0.2
+	p.sustain = 0.0
+	p.release = 0.1
+	p.filter_type = FilterType.LOWPASS
+	p.filter_cutoff = 0.25
+	p.filter_resonance = 0.5
+	p.filter_env_amount = 0.6
+	p.filter_attack = 0.001
+	p.filter_decay = 0.15
+	p.filter_sustain = 0.0
+	p.gain = 0.4
+	p.rebuild()
+	return p
+
+static func make_sweep_sfx() -> SynthPatch:
+	var p := SynthPatch.new()
+	p.patch_name = "Sweep SFX"
+	p.waveform = Waveform.SAW
+	p.attack = 0.001
+	p.decay = 0.6
+	p.sustain = 0.0
+	p.release = 0.2
+	p.filter_type = FilterType.LOWPASS
+	p.filter_cutoff = 0.1
+	p.filter_resonance = 0.7
+	p.filter_env_amount = 0.85
+	p.filter_attack = 0.4
+	p.filter_decay = 0.5
+	p.filter_sustain = 0.0
+	p.gain = 0.35
+	p.rebuild()
+	return p
+
+# --- Drum presets using the new noise features -----------------------------
+
+static func make_snare_snappy() -> SynthPatch:
+	var p := SynthPatch.new()
+	p.patch_name = "Snare Snappy"
+	p.waveform = Waveform.TRIANGLE
+	p.noise_mix = 0.75
+	p.noise_decay = 0.09
+	p.noise_lowpass = 0.55
+	p.noise_highpass = 0.35
+	p.attack = 0.001
+	p.decay = 0.2
+	p.sustain = 0.0
+	p.release = 0.05
+	p.pitch_decay_semitones = 18.0
+	p.pitch_decay_time = 0.03
+	p.gain = 0.5
+	p.rebuild()
+	return p
+
+static func make_hihat_open() -> SynthPatch:
+	var p := SynthPatch.new()
+	p.patch_name = "Hi-Hat Open"
+	p.waveform = Waveform.SINE
+	p.noise_mix = 1.0
+	p.noise_decay = 0.35
+	p.noise_highpass = 0.65
+	p.attack = 0.001
+	p.decay = 0.4
+	p.sustain = 0.0
+	p.release = 0.2
+	p.gain = 0.3
+	p.rebuild()
+	return p
+
+static func make_cymbal_crash() -> SynthPatch:
+	var p := SynthPatch.new()
+	p.patch_name = "Cymbal Crash"
+	p.waveform = Waveform.SINE
+	p.noise_mix = 1.0
+	p.noise_decay = 1.5
+	p.noise_highpass = 0.8
+	p.attack = 0.001
+	p.decay = 1.2
+	p.sustain = 0.0
+	p.release = 0.8
+	p.gain = 0.28
 	p.rebuild()
 	return p
