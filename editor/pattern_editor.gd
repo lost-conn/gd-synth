@@ -500,6 +500,13 @@ func _ensure_preview_nodes() -> void:
 	add_child(_preview_director)
 	_preview_track = MusicTrack.new()
 	_preview_track.name = "PreviewTrack"
+	# Pre-set runtime refs + disable autoplay BEFORE add_child, so the
+	# track's _ready doesn't grab the global /root/Music and /root/Synth
+	# autoloads (which would route preview audio through the main game's
+	# synth instead of our isolated preview synth).
+	_preview_track.director = _preview_director
+	_preview_track.synth = _preview_synth
+	_preview_track.autoplay = false
 	add_child(_preview_track)
 	_piano_roll.director = _preview_director
 
@@ -517,7 +524,7 @@ func _start_preview() -> void:
 	_preview_track.patch = patch_to_use
 	_preview_track.synth_channel = 0
 	_preview_track.base_octave = preview_base_octave
-	_preview_track.bind(_preview_director, _preview_synth)
+	_preview_track.activate()
 	_preview_director.data = preview_music_data
 	_preview_director.play()
 

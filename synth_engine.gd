@@ -66,40 +66,140 @@ class Voice:
 	var noise_env: float = 1.0
 	var noise_lp_state: float = 0.0
 	var noise_hp_state: float = 0.0
+	# Stereo pan (-1 = full left, 0 = center, +1 = full right)
+	var pan: float = 0.0
 
-var _player: AudioStreamPlayer
-var _playback: AudioStreamGeneratorPlayback
+# One AudioStreamPlayer per channel (0..15), each routable to its own
+# audio bus so users can attach Godot's built-in effects (reverb, delay,
+# EQ, distortion, compressor, etc.) via the editor's Audio dock.
+var _channel_players: Array[AudioStreamPlayer] = []
+var _channel_playbacks: Array[AudioStreamGeneratorPlayback] = []
+# Name of the auto-created AudioServer bus per channel (empty if none).
+# Managed by ensure_channel_bus / release_channel_bus. Cleaned up on
+# _exit_tree.
+var _channel_buses: Array[StringName] = []
 var _voices: Array[Voice] = []
 var _patches: Array[SynthPatch] = []
 var _default_patch: SynthPatch
 var _age_counter: int = 0
 var _lfo_time: float = 0.0
 
+# Flat mixdown buffer: index = channel * frames + sample_index.
+# Stored as a member to avoid aliasing (PackedArrays stored in a containing
+# Array trigger copy-on-write on subscript mutation; direct member access
+# stays at refcount=1 so writes are in-place.
+var _mixdown: PackedVector2Array = PackedVector2Array()
+var _push_buf: PackedVector2Array = PackedVector2Array()
+
+const CHANNEL_COUNT := 16
+
 func _ready() -> void:
-	var stream := AudioStreamGenerator.new()
-	stream.mix_rate = mix_rate
-	stream.buffer_length = buffer_length
-	_player = AudioStreamPlayer.new()
-	_player.stream = stream
-	add_child(_player)
-	_player.play()
-	_playback = _player.get_stream_playback()
+	_channel_players.resize(CHANNEL_COUNT)
+	_channel_playbacks.resize(CHANNEL_COUNT)
+	_channel_buses.resize(CHANNEL_COUNT)
+	for ch in CHANNEL_COUNT:
+		var stream := AudioStreamGenerator.new()
+		stream.mix_rate = mix_rate
+		stream.buffer_length = buffer_length
+		var player := AudioStreamPlayer.new()
+		player.name = "Ch%dPlayer" % ch
+		player.stream = stream
+		player.bus = &"Master"
+		add_child(player)
+		player.play()
+		_channel_players[ch] = player
+		_channel_playbacks[ch] = player.get_stream_playback()
+		_channel_buses[ch] = &""
 
 	_voices.resize(max_voices)
 	for i in max_voices:
 		_voices[i] = Voice.new()
 
 	_default_patch = SynthPatch.new()
-	_patches.resize(16)
-	for i in 16:
+	_patches.resize(CHANNEL_COUNT)
+	for i in CHANNEL_COUNT:
 		_patches[i] = _default_patch
+
+## Route a channel's output to a named audio bus. Users can create buses
+## in Godot's Audio dock and attach AudioEffect* nodes (reverb, delay,
+## EQ, chorus, distortion, etc.) — those effects then process this
+## channel's output before it reaches the master.
+func set_channel_bus(channel: int, bus: StringName) -> void:
+	if channel < 0 or channel >= CHANNEL_COUNT:
+		return
+	var p := _channel_players[channel]
+	if p != null:
+		p.bus = bus
+
+func get_channel_bus(channel: int) -> StringName:
+	if channel < 0 or channel >= CHANNEL_COUNT:
+		return &"Master"
+	var p := _channel_players[channel]
+	return p.bus if p != null else &"Master"
+
+## Ensure an auto-bus exists for [param channel], has exactly the given
+## [param effects] in order, and sends to [param send_target]. Routes
+## the channel's output to this bus. Subsequent calls for the same
+## channel replace the effect chain (old effects removed, new ones
+## added). Effects are installed by reference — editing an AudioEffect
+## resource at runtime affects the live audio.
+func ensure_channel_bus(channel: int, effects: Array, send_target: StringName = &"Master") -> StringName:
+	if channel < 0 or channel >= CHANNEL_COUNT:
+		return &"Master"
+	var name: StringName = _channel_buses[channel]
+	var idx: int = -1
+	if name != &"":
+		idx = AudioServer.get_bus_index(name)
+	if idx == -1:
+		var base := StringName("Ch%d" % channel)
+		name = _unique_bus_name(base)
+		idx = AudioServer.bus_count
+		AudioServer.add_bus(idx)
+		AudioServer.set_bus_name(idx, name)
+		_channel_buses[channel] = name
+	# Clear + install fresh effect chain.
+	while AudioServer.get_bus_effect_count(idx) > 0:
+		AudioServer.remove_bus_effect(idx, 0)
+	for eff in effects:
+		if eff != null:
+			AudioServer.add_bus_effect(idx, eff)
+	AudioServer.set_bus_send(idx, send_target)
+	set_channel_bus(channel, name)
+	return name
+
+## Remove the auto-bus for [param channel] and reset the channel's
+## output to Master. Called internally on _exit_tree; game code rarely
+## needs this directly.
+func release_channel_bus(channel: int) -> void:
+	if channel < 0 or channel >= CHANNEL_COUNT:
+		return
+	var name: StringName = _channel_buses[channel]
+	if name == &"":
+		return
+	var idx: int = AudioServer.get_bus_index(name)
+	if idx != -1:
+		AudioServer.remove_bus(idx)
+	_channel_buses[channel] = &""
+	set_channel_bus(channel, &"Master")
+
+func _unique_bus_name(base: StringName) -> StringName:
+	if AudioServer.get_bus_index(base) == -1:
+		return base
+	var i: int = 2
+	while AudioServer.get_bus_index(StringName("%s_%d" % [base, i])) != -1:
+		i += 1
+	return StringName("%s_%d" % [base, i])
+
+func _exit_tree() -> void:
+	for ch in CHANNEL_COUNT:
+		release_channel_bus(ch)
 
 func set_patch(channel: int, patch: SynthPatch) -> void:
 	if channel < 0 or channel >= 16 or patch == null:
 		return
 	_patches[channel] = patch
 
-func note_on(channel: int, note: int, velocity: float = 1.0) -> void:
+func note_on(channel: int, note: int, velocity: float = 1.0, pan: float = 0.0) -> void:
 	var v := _allocate_voice()
 	var patch: SynthPatch = _patches[channel]
 	_age_counter += 1
@@ -107,8 +207,16 @@ func note_on(channel: int, note: int, velocity: float = 1.0) -> void:
 	v.released = false
 	v.channel = channel
 	v.note = note
-	v.freq = 440.0 * pow(2.0, (note - 69) / 12.0)
-	v.velocity = clamp(velocity, 0.0, 1.0)
+	var effective_freq: float = 440.0 * pow(2.0, (note - 69) / 12.0)
+	if patch.pitch_randomize_cents > 0.0:
+		var cents: float = (randf() * 2.0 - 1.0) * patch.pitch_randomize_cents
+		effective_freq *= pow(2.0, cents / 1200.0)
+	v.freq = effective_freq
+	var eff_vel: float = clamp(velocity, 0.0, 1.0)
+	if patch.velocity_randomize > 0.0:
+		eff_vel *= lerpf(1.0 - patch.velocity_randomize, 1.0, randf())
+	v.velocity = eff_vel
+	v.pan = clampf(pan, -1.0, 1.0)
 	v.patch = patch
 	v.phase = 0.0
 	v.env_state = ENV_ATTACK
@@ -159,34 +267,54 @@ func _allocate_voice() -> Voice:
 	return oldest
 
 func _process(_delta: float) -> void:
-	if _playback == null:
+	if _channel_playbacks.is_empty() or _channel_playbacks[0] == null:
 		return
-	var frames := _playback.get_frames_available()
+	# Use channel 0's playback to determine how many frames to fill; all
+	# channels share the same mix_rate + buffer_length so they stay in sync.
+	var frames := _channel_playbacks[0].get_frames_available()
 	if frames <= 0:
 		return
 	var dt := 1.0 / mix_rate
-	var buf := PackedVector2Array()
-	buf.resize(frames)
 
 	# Precompute expensive SVF coefficients once per buffer (tan + pow).
 	for v in _voices:
 		if v.active and v.patch != null and v.patch.filter_type != SynthPatch.FilterType.OFF:
 			_update_svf_coefs(v, v.patch)
 
+	# Resize + zero the flat mixdown buffer.
+	var total_frames := CHANNEL_COUNT * frames
+	if _mixdown.size() != total_frames:
+		_mixdown.resize(total_frames)
+	_mixdown.fill(Vector2.ZERO)
+
+	# Render all voices, accumulate to their channel's slice of the buffer.
 	for i in frames:
 		_lfo_time += dt
-		var sample := 0.0
 		for v in _voices:
 			if v.active:
-				sample += _render_voice(v, dt)
-		sample *= master_gain
-		if sample > 1.0:
-			sample = 1.0
-		elif sample < -1.0:
-			sample = -1.0
-		buf[i] = Vector2(sample, sample)
+				var s := _render_voice(v, dt)
+				var l: float = s * (1.0 - maxf(v.pan, 0.0))
+				var r: float = s * (1.0 + minf(v.pan, 0.0))
+				var idx: int = v.channel * frames + i
+				var cur: Vector2 = _mixdown[idx]
+				_mixdown[idx] = Vector2(cur.x + l, cur.y + r)
 
-	_playback.push_buffer(buf)
+	# Per-channel: apply master gain, clip, push to that channel's player.
+	if _push_buf.size() != frames:
+		_push_buf.resize(frames)
+	for ch in CHANNEL_COUNT:
+		var playback: AudioStreamGeneratorPlayback = _channel_playbacks[ch]
+		if playback == null:
+			continue
+		var base := ch * frames
+		for i in frames:
+			var s: Vector2 = _mixdown[base + i] * master_gain
+			if s.x > 1.0: s.x = 1.0
+			elif s.x < -1.0: s.x = -1.0
+			if s.y > 1.0: s.y = 1.0
+			elif s.y < -1.0: s.y = -1.0
+			_push_buf[i] = s
+		playback.push_buffer(_push_buf)
 
 func _update_svf_coefs(v: Voice, p: SynthPatch) -> void:
 	# Effective cutoff: base + envelope modulation, clamped to 0..1.

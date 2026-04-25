@@ -25,9 +25,10 @@ script = ExtResource("2_synth")
 [node name="MidiPlayer" type="Node" parent="." unique_id=665012390]
 script = ExtResource("3_midi")
 
-[node name="EditorLayer" type="CanvasLayer" parent="."]
+[node name="EditorLayer" type="CanvasLayer" parent="." unique_id=1827216491]
 
-[node name="EditorScroll" type="ScrollContainer" parent="EditorLayer"]
+[node name="EditorScroll" type="ScrollContainer" parent="EditorLayer" unique_id=1287381395]
+anchors_preset = 9
 anchor_bottom = 1.0
 offset_left = 10.0
 offset_top = 10.0
@@ -35,7 +36,8 @@ offset_right = 670.0
 offset_bottom = -10.0
 horizontal_scroll_mode = 0
 
-[node name="PatchEditor" type="PanelContainer" parent="EditorLayer/EditorScroll"]
+[node name="PatchEditor" type="PanelContainer" parent="EditorLayer/EditorScroll" unique_id=927470799]
 custom_minimum_size = Vector2(640, 0)
+layout_mode = 2
 size_flags_horizontal = 0
 script = ExtResource("5_editor")

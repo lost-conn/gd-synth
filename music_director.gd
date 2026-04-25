@@ -13,6 +13,11 @@ signal beat_tick(beat_number: int)
 signal block_changed(block: MusicBlock, index: int)
 signal seeked
 
+## When a transition takes effect — used by [method swap_data], by
+## MusicDataPlayer.swap_mode, and by MusicTrack.swap_mode.
+##   IMMEDIATE   — apply right now
+##   NEXT_BEAT   — defer to the next integer beat boundary
+##   NEXT_BLOCK  — defer to the next block boundary in the progression
 enum SwapMode { IMMEDIATE, NEXT_BEAT, NEXT_BLOCK }
 
 ## The progression to play. Holds BPM and the list of MusicBlocks that

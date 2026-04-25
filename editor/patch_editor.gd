@@ -226,6 +226,9 @@ func _build_params(parent: VBoxContainer) -> void:
 	_add_slider_row(grid, "noise_highpass", "Noise highpass", 0.0, 1.0, 0.01)
 	_add_slider_row(grid, "pitch_decay_semitones", "Pitch decay (semi)", 0.0, 96.0, 0.5)
 	_add_slider_row(grid, "pitch_decay_time", "Pitch decay time (s)", 0.0, 1.0, 0.001)
+	# Humanization
+	_add_slider_row(grid, "pitch_randomize_cents", "Pitch randomize (cents)", 0.0, 100.0, 0.5)
+	_add_slider_row(grid, "velocity_randomize", "Velocity randomize", 0.0, 1.0, 0.01)
 
 func _add_slider_row(grid: GridContainer, prop: String, label: String, mn: float, mx: float, step: float) -> void:
 	grid.add_child(_label(label))

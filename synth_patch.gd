@@ -83,6 +83,17 @@ enum FilterType { OFF, LOWPASS, HIGHPASS, BANDPASS }
 ## Vibrato pitch-modulation depth in cents. 100 cents = one semitone.
 @export var vibrato_depth_cents: float = 0.0
 
+@export_group("Humanization")
+
+## Maximum random pitch deviation applied on every note_on, in cents.
+## 0 disables. Good for repeated SFX so successive plays don't sound
+## identical. ~10-20 cents is subtle; 50+ is obvious detuning.
+@export var pitch_randomize_cents: float = 0.0
+
+## Maximum velocity reduction applied on every note_on, 0..1. 0 disables;
+## 0.2 = velocity varies down to 80% of requested.
+@export_range(0.0, 1.0) var velocity_randomize: float = 0.0
+
 @export_group("FM")
 
 ## Modulator frequency as a ratio of the carrier (1.0 = same freq,
