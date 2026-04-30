@@ -63,6 +63,11 @@ enum TrackType { CHORD, MELODY, DRUM }
 ## 0 = center, +1 = full right).
 @export_range(-1.0, 1.0) var pan: float = 0.0
 
+## Multiplier applied to every note's velocity when triggered. Useful
+## for transient SFX attenuation (e.g. distance-based volume) without
+## rewriting the pattern. Caller sets before play_once / activate.
+var velocity_scale: float = 1.0
+
 @export_group("Bus Routing")
 
 ## Send target for this channel's auto-bus (see [SynthEngine.ensure_channel_bus]).
@@ -79,8 +84,17 @@ enum TrackType { CHORD, MELODY, DRUM }
 
 ## When > 0, track uses its own local clock at this BPM instead of the
 ## director's beat counter. The track plays independent of director
-## play/stop and of [method MusicDirector.seek].
-@export var bpm_override: float = 0.0
+## play/stop and of [method MusicDirector.seek]. Safe to change at
+## runtime — the setter rescales the local clock so the pattern cursor
+## stays continuous (no note stampede on tempo changes).
+@export var bpm_override: float = 0.0:
+	set(value):
+		var prev_effective: float = _effective_beats()
+		bpm_override = maxf(0.0, value)
+		if bpm_override > 0.0 and prev_effective > 0.0:
+			_local_time = prev_effective * 60.0 / bpm_override
+		elif bpm_override <= 0.0:
+			_local_time = 0.0
 
 ## When set, pitches resolve against this block instead of the director's
 ## current block. Track is unaffected by [signal MusicDirector.block_changed].
@@ -115,6 +129,9 @@ var _local_time: float = 0.0
 var _prev_cursor: float = -0.001
 # Each entry: {"midi": int, "off_time": float} (off_time in effective beats)
 var _active_notes: Array = []
+# Counter for play_once() to invalidate stale deferred deactivates when
+# the same track is re-triggered rapidly.
+var _play_once_token: int = 0
 
 # ---------------------------------------------------------------------------
 # Lifecycle
@@ -167,6 +184,30 @@ func deactivate() -> void:
 	_release_all()
 	_active = false
 	_was_playing = false
+
+## Whether this track is currently activated (playing or pending start).
+func is_active() -> bool:
+	return _active
+
+## SFX-style one-shot: activate, await one full pattern length, then
+## deactivate. Idempotent under rapid re-trigger — only the most recent
+## call's deferred deactivate fires (older awaits no-op via token check).
+func play_once() -> void:
+	activate()
+	if pattern == null or pattern.length_beats <= 0.0:
+		return
+	_play_once_token += 1
+	var token: int = _play_once_token
+	var bpm: float = bpm_override
+	if bpm <= 0.0:
+		if director != null and director.data != null:
+			bpm = director.data.bpm
+	if bpm <= 0.0:
+		bpm = 120.0
+	var seconds: float = pattern.length_beats * 60.0 / bpm
+	await get_tree().create_timer(seconds).timeout
+	if token == _play_once_token:
+		deactivate()
 
 ## Swap the patch on this track's channel. No effect on pattern state.
 func swap_patch(new_patch: SynthPatch) -> void:
@@ -338,7 +379,7 @@ func _sync_cursor_to_now() -> void:
 
 func _trigger_note(note: PatternNote, effective_beats: float) -> void:
 	var midi: int = _resolve_midi(note)
-	synth.note_on(synth_channel, midi, note.velocity, pan)
+	synth.note_on(synth_channel, midi, clampf(note.velocity * velocity_scale, 0.0, 1.0), pan)
 	_active_notes.append({"midi": midi, "off_time": effective_beats + note.duration})
 
 func _resolve_midi(note: PatternNote) -> int:
