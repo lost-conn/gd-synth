@@ -5,7 +5,7 @@ extends PanelContainer
 # container hosting the piano roll, and a footer panel with note
 # properties for the currently selected note.
 
-const PianoRollScript := preload("res://addons/godot_synth/editor/piano_roll.gd")
+const PianoRollScript := preload("uid://5xhqwgw3xrfc")
 
 ## MusicData used when previewing the pattern. Assign a .tres in the
 ## inspector or via the toolbar button. Provides chord/scale context so
@@ -44,7 +44,13 @@ var _data_dialog: FileDialog
 var _patch_dialog: FileDialog
 
 var _selected_note: PatternNote
+var _selected_bend: PatternBend
+var _selected_bend_parent_array: Array
+var _selected_bend_note: PatternNote
 var _footer_controls: Dictionary = {}
+var _bend_controls: Dictionary = {}
+var _note_footer: VBoxContainer
+var _bend_footer: VBoxContainer
 var _suppress: bool = false
 
 func _ready() -> void:
@@ -212,22 +218,63 @@ func _build_body(parent: VBoxContainer) -> void:
 
 	_piano_roll = PianoRollScript.new()
 	_piano_roll.selection_changed.connect(_on_selection_changed)
+	_piano_roll.bend_selection_changed.connect(_on_bend_selection_changed)
 	_piano_roll.pattern_changed.connect(_on_pattern_changed)
 	scroll.add_child(_piano_roll)
 
 	var footer := VBoxContainer.new()
-	footer.custom_minimum_size = Vector2(200, 0)
+	footer.custom_minimum_size = Vector2(220, 0)
 	footer.size_flags_vertical = Control.SIZE_EXPAND_FILL
 	footer.add_theme_constant_override("separation", 4)
 	body.add_child(footer)
 
-	footer.add_child(_label("Note properties"))
-	_add_footer_spin(footer, "index", "Index", -48, 48, 1)
-	_add_footer_spin(footer, "octave", "Octave", -4, 4, 1)
-	_add_footer_spin(footer, "accidental", "Accidental", -2, 2, 1)
-	_add_footer_spin(footer, "beat", "Beat", 0.0, 256.0, 0.01)
-	_add_footer_spin(footer, "duration", "Duration", 0.01, 64.0, 0.01)
-	_add_footer_slider(footer, "velocity", "Velocity", 0.0, 1.0, 0.01)
+	# --- Note properties panel ----------------------------------------
+	_note_footer = VBoxContainer.new()
+	_note_footer.add_theme_constant_override("separation", 4)
+	footer.add_child(_note_footer)
+	_note_footer.add_child(_label("Note properties"))
+	_add_footer_spin(_note_footer, "index", "Index", -48, 48, 1)
+	_add_footer_spin(_note_footer, "octave", "Octave", -4, 4, 1)
+	_add_footer_spin(_note_footer, "accidental", "Accidental", -12.0, 12.0, 0.01)
+	_add_footer_spin(_note_footer, "beat", "Beat", 0.0, 256.0, 0.01)
+	_add_footer_spin(_note_footer, "duration", "Duration", 0.01, 64.0, 0.01)
+	_add_footer_slider(_note_footer, "velocity", "Velocity", 0.0, 1.0, 0.01)
+	var add_bend_btn := Button.new()
+	add_bend_btn.text = "+ Bend"
+	add_bend_btn.pressed.connect(_on_add_bend_pressed)
+	_note_footer.add_child(add_bend_btn)
+
+	# --- Bend properties panel (hidden until a bend is selected) -------
+	_bend_footer = VBoxContainer.new()
+	_bend_footer.add_theme_constant_override("separation", 4)
+	_bend_footer.visible = false
+	footer.add_child(_bend_footer)
+	_bend_footer.add_child(_label("Bend properties"))
+	_add_bend_spin("offset_beats", "Offset", 0.0, 64.0, 0.01)
+	_add_bend_spin("glide_beats", "Glide", 0.0, 64.0, 0.01)
+	_add_bend_spin("index", "Index", -48.0, 48.0, 1.0)
+	_add_bend_spin("octave", "Octave", -4.0, 4.0, 1.0)
+	_add_bend_spin("accidental", "Accidental", -12.0, 12.0, 0.01)
+	var add_sub_btn := Button.new()
+	add_sub_btn.text = "+ Sub-bend"
+	add_sub_btn.pressed.connect(_on_add_sub_bend_pressed)
+	_bend_footer.add_child(add_sub_btn)
+
+func _add_bend_spin(prop: String, label: String, mn: float, mx: float, step: float) -> void:
+	var row := HBoxContainer.new()
+	_bend_footer.add_child(row)
+	var lbl := Label.new()
+	lbl.text = label
+	lbl.custom_minimum_size = Vector2(80, 0)
+	row.add_child(lbl)
+	var sp := SpinBox.new()
+	sp.min_value = mn
+	sp.max_value = mx
+	sp.step = step
+	sp.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	sp.value_changed.connect(_on_bend_footer_edited.bind(prop))
+	row.add_child(sp)
+	_bend_controls[prop] = sp
 
 func _add_footer_spin(parent: VBoxContainer, prop: String, label: String, mn: float, mx: float, step: float) -> void:
 	var row := HBoxContainer.new()
@@ -325,6 +372,11 @@ func _refresh_toolbar() -> void:
 
 func _refresh_footer() -> void:
 	_suppress = true
+	# Toggle panel visibility based on which (if any) thing is selected.
+	# Bend selection wins because the piano roll clears note selection
+	# when a bend is picked.
+	_bend_footer.visible = _selected_bend != null
+	_note_footer.visible = _selected_bend == null
 	var enabled: bool = _selected_note != null
 	for prop in _footer_controls.keys():
 		var c: Control = _footer_controls[prop]
@@ -339,6 +391,12 @@ func _refresh_footer() -> void:
 		(_footer_controls["beat"] as SpinBox).value = _selected_note.beat
 		(_footer_controls["duration"] as SpinBox).value = _selected_note.duration
 		(_footer_controls["velocity"] as HSlider).value = _selected_note.velocity
+	if _selected_bend != null:
+		(_bend_controls["offset_beats"] as SpinBox).value = _selected_bend.offset_beats
+		(_bend_controls["glide_beats"] as SpinBox).value = _selected_bend.glide_beats
+		(_bend_controls["index"] as SpinBox).value = _selected_bend.index
+		(_bend_controls["octave"] as SpinBox).value = _selected_bend.octave
+		(_bend_controls["accidental"] as SpinBox).value = _selected_bend.accidental
 	_suppress = false
 	_update_status()
 
@@ -364,6 +422,20 @@ func _update_status() -> void:
 
 func _on_selection_changed(selected: Array) -> void:
 	_selected_note = selected[0] if selected.size() > 0 else null
+	# Selecting a note clears any pre-existing bend selection (piano roll
+	# already does this internally, but mirror it here so the panels swap).
+	if _selected_note != null:
+		_selected_bend = null
+		_selected_bend_parent_array = []
+		_selected_bend_note = null
+	_refresh_footer()
+
+func _on_bend_selection_changed(bend: PatternBend, parent_note: PatternNote) -> void:
+	_selected_bend = bend
+	_selected_bend_note = parent_note
+	# We don't get the parent_array via signal — query the piano roll, which
+	# tracks it internally. (`add_bend` calls into the roll which knows.)
+	_selected_bend_parent_array = _piano_roll._selected_bend_parent_array if bend != null else []
 	_refresh_footer()
 
 func _on_pattern_changed() -> void:
@@ -387,16 +459,37 @@ func _on_snap_changed(idx: int) -> void:
 func _on_footer_edited(value: float, prop: String) -> void:
 	if _suppress or _selected_note == null:
 		return
-	if prop == "velocity":
-		_selected_note.velocity = value
-	elif prop == "beat":
-		_selected_note.beat = value
-	elif prop == "duration":
-		_selected_note.duration = value
+	# accidental is float (microtonal); beat/duration/velocity always float.
+	if prop in ["velocity", "beat", "duration", "accidental"]:
+		_selected_note.set(prop, value)
 	else:
 		_selected_note.set(prop, int(value))
 	_piano_roll.refresh()
 	_update_status()
+
+func _on_bend_footer_edited(value: float, prop: String) -> void:
+	if _suppress or _selected_bend == null:
+		return
+	# Float props (continuous time / pitch); int props (index/octave snap).
+	if prop in ["offset_beats", "glide_beats", "accidental"]:
+		_selected_bend.set(prop, value)
+	else:
+		_selected_bend.set(prop, int(value))
+	_piano_roll.refresh()
+	_update_status()
+
+func _on_add_bend_pressed() -> void:
+	if _selected_note == null:
+		return
+	# Target = a couple rows above the note for an audible upward bend by default.
+	var target_idx: int = _selected_note.index + 2
+	_piano_roll.add_bend(_selected_note.bends, _selected_note, target_idx)
+
+func _on_add_sub_bend_pressed() -> void:
+	if _selected_bend == null:
+		return
+	var target_idx: int = _selected_bend.index + 2
+	_piano_roll.add_bend(_selected_bend.bends, _selected_bend_note, target_idx)
 
 # ---------------------------------------------------------------------------
 # New / Load / Save

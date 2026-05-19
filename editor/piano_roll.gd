@@ -13,9 +13,14 @@ extends Control
 # Row semantics depend on track_type (see _row_label).
 
 signal selection_changed(selected: Array)
+## Emitted when a PatternBend is selected (or selection cleared). `bend`
+## and `parent_note` are null when cleared. Bend selection is exclusive
+## with note selection — picking a bend clears the note selection and
+## vice-versa.
+signal bend_selection_changed(bend: PatternBend, parent_note: PatternNote)
 signal pattern_changed
 
-enum DragState { IDLE, CREATING, MOVING, RESIZING, MARQUEE, SEEKING }
+enum DragState { IDLE, CREATING, MOVING, RESIZING, MARQUEE, SEEKING, BEND_TIP }
 
 const GUTTER_WIDTH: float = 64.0
 const RULER_HEIGHT: float = 20.0
@@ -34,6 +39,11 @@ const MARQUEE_BORDER := Color(0.97, 0.73, 0.33, 0.75)
 const NOTE_FILL := Color(0.42, 0.65, 0.92)
 const NOTE_BORDER := Color(0.90, 0.95, 1.0)
 const NOTE_SELECTED := Color(0.97, 0.73, 0.33)
+const BEND_LINE := Color(0.40, 0.90, 0.75, 0.95)
+const BEND_LINE_SELECTED := Color(0.97, 0.73, 0.33, 0.95)
+const BEND_TIP := Color(0.85, 1.0, 0.95)
+const BEND_TIP_RADIUS: float = 5.0
+const BEND_SEGMENT_HIT_TOL: float = 4.0
 const LABEL_COLOR := Color(0.70, 0.72, 0.78)
 const ACCIDENTAL_COLOR := Color(1.0, 1.0, 0.5)
 const RULER_BG := Color(0.04, 0.04, 0.06)
@@ -90,6 +100,19 @@ var _clipboard: Array = []  # Array of PatternNote (deep copies)
 var _last_mouse_pos: Vector2 = Vector2.ZERO
 var _drag_state: int = DragState.IDLE
 var _drag_note: PatternNote
+var _drag_bend: PatternBend
+# The Array that holds _drag_bend (either a note's `bends` or another
+# bend's `bends`). Kept alongside _drag_bend so deletion can erase from
+# the right collection.
+var _drag_bend_parent_array: Array
+var _drag_bend_note: PatternNote
+# Beat coordinate where the dragged bend "starts" (= parent_start_beat +
+# bend.offset_beats). Used during tip drag to recompute glide_beats from
+# the cursor position without re-walking the bend chain.
+var _drag_bend_start_beat: float = 0.0
+var _selected_bend: PatternBend
+var _selected_bend_parent_array: Array
+var _selected_bend_note: PatternNote
 var _drag_start_pos: Vector2
 var _drag_origin: Dictionary = {}
 var _marquee_anchor: Vector2
@@ -139,6 +162,7 @@ func _draw() -> void:
 	_draw_row_backgrounds()
 	_draw_grid_lines()
 	_draw_notes()
+	_draw_bends()
 	_draw_ruler()
 	_draw_gutter()
 	if _drag_state == DragState.MARQUEE:
@@ -223,6 +247,43 @@ func _draw_notes() -> void:
 			draw_string(_font, Vector2(rect.position.x + 3.0, rect.end.y - 3.0), sym,
 				HORIZONTAL_ALIGNMENT_LEFT, rect.size.x, 10, ACCIDENTAL_COLOR)
 
+func _draw_bends() -> void:
+	for note in pattern.notes:
+		for bend in note.bends:
+			_draw_bend_recursive(note.beat, note.index, note.accidental, note, bend)
+
+## Draw [param bend] as a line from (parent_start_beat, parent_pitch_y)
+## sloping to (parent_start_beat + offset + glide, target_pitch_y). Then
+## recurse: child bends draw with this bend's tip as their visual
+## anchor. Time-anchor for the child is this bend's start beat (matches
+## runtime — child.offset is relative to parent bend's start, not its end).
+func _draw_bend_recursive(parent_start_beat: float, parent_index: int, parent_acc: float,
+		note: PatternNote, bend: PatternBend) -> void:
+	var start_beat: float = parent_start_beat + bend.offset_beats
+	var end_beat: float = start_beat + bend.glide_beats
+	var start: Vector2 = _bend_anchor(start_beat, parent_index, parent_acc)
+	var tip: Vector2 = _bend_anchor(end_beat, bend.index, bend.accidental)
+	var is_sel: bool = bend == _selected_bend
+	var col: Color = BEND_LINE_SELECTED if is_sel else BEND_LINE
+	draw_line(start, tip, col, 2.0)
+	# Tip handle — grabbable point for retarget / resize-glide.
+	draw_circle(tip, BEND_TIP_RADIUS, BEND_TIP if is_sel else col)
+	if is_sel:
+		draw_circle(tip, BEND_TIP_RADIUS, BEND_LINE_SELECTED, false, 1.5)
+	# Recurse — child's "parent pitch" visually equals this bend's target.
+	for child in bend.bends:
+		_draw_bend_recursive(start_beat, bend.index, bend.accidental, note, child)
+
+func _bend_anchor(beat: float, row_index: int, accidental: float) -> Vector2:
+	var x: float = GUTTER_WIDTH + beat * beat_width
+	# Center vertically on the row; lift by accidental shift (only MELODY
+	# tracks visualize accidental — for CHORD/DRUM the shift is zero so
+	# this is harmless).
+	var y: float = _row_y(row_index) + row_height * 0.5
+	if track_type == MusicTrack.TrackType.MELODY:
+		y -= accidental * row_height * ACCIDENTAL_SHIFT
+	return Vector2(x, y)
+
 func _draw_gutter() -> void:
 	draw_rect(Rect2(Vector2.ZERO, Vector2(GUTTER_WIDTH, size.y)), GUTTER_COLOR)
 	draw_line(Vector2(GUTTER_WIDTH, 0.0), Vector2(GUTTER_WIDTH, size.y), GRID_BAR, 1.0)
@@ -299,6 +360,64 @@ func _note_rect(note: PatternNote) -> Rect2:
 		shift = -float(note.accidental) * row_height * ACCIDENTAL_SHIFT
 	return Rect2(x, y + shift + 1.0, w, row_height - 2.0)
 
+## Find a bend whose tip handle or segment is under [param pos]. Returns
+## a dict {bend, parent_array, note, start_beat} for a hit, or {} for miss.
+## Tips are preferred over segments (smaller hit area, higher priority).
+## Children are walked first so nested bends layered on top of their
+## parents are pickable.
+func _bend_at(pos: Vector2) -> Dictionary:
+	if pattern == null:
+		return {}
+	# Two passes: tips first (preferred), then segments. Within each
+	# pass, iterate notes/bends in reverse so later-drawn = topmost.
+	var tip_hit: Dictionary = {}
+	var seg_hit: Dictionary = {}
+	for ni in range(pattern.notes.size() - 1, -1, -1):
+		var note: PatternNote = pattern.notes[ni]
+		var found: Dictionary = _bend_at_recursive(pos, note.beat, note.index, note.accidental,
+			note, note.bends)
+		if not found.is_empty():
+			if found.get("tip", false):
+				tip_hit = found
+				break
+			elif seg_hit.is_empty():
+				seg_hit = found
+	if not tip_hit.is_empty():
+		return tip_hit
+	return seg_hit
+
+func _bend_at_recursive(pos: Vector2, parent_start_beat: float, parent_index: int,
+		parent_acc: float, note: PatternNote, bends: Array[PatternBend]) -> Dictionary:
+	# Walk children first (topmost), then siblings in reverse insertion
+	# order so visually-on-top bends win the hit test.
+	for i in range(bends.size() - 1, -1, -1):
+		var bend: PatternBend = bends[i]
+		var start_beat: float = parent_start_beat + bend.offset_beats
+		var end_beat: float = start_beat + bend.glide_beats
+		var start: Vector2 = _bend_anchor(start_beat, parent_index, parent_acc)
+		var tip: Vector2 = _bend_anchor(end_beat, bend.index, bend.accidental)
+		# Recurse into this bend's children first — they're drawn over.
+		var nested: Dictionary = _bend_at_recursive(pos, start_beat, bend.index,
+			bend.accidental, note, bend.bends)
+		if not nested.is_empty():
+			return nested
+		if pos.distance_to(tip) <= BEND_TIP_RADIUS + 1.0:
+			return {"bend": bend, "parent_array": bends, "note": note,
+					"start_beat": start_beat, "tip": true}
+		if _point_near_segment(pos, start, tip, BEND_SEGMENT_HIT_TOL):
+			return {"bend": bend, "parent_array": bends, "note": note,
+					"start_beat": start_beat, "tip": false}
+	return {}
+
+func _point_near_segment(p: Vector2, a: Vector2, b: Vector2, tol: float) -> bool:
+	var ab: Vector2 = b - a
+	var len_sq: float = ab.length_squared()
+	if len_sq < 0.0001:
+		return p.distance_to(a) <= tol
+	var t: float = clampf((p - a).dot(ab) / len_sq, 0.0, 1.0)
+	var closest: Vector2 = a + ab * t
+	return p.distance_to(closest) <= tol
+
 func _note_at(pos: Vector2) -> PatternNote:
 	if pattern == null:
 		return null
@@ -337,6 +456,19 @@ func _handle_button(event: InputEventMouseButton) -> void:
 				return
 			if pos.x < GUTTER_WIDTH:
 				return
+			# Bend hits take priority over notes — their tips/segments
+			# can overlap a note's rect and we'd miss them otherwise.
+			var bend_hit: Dictionary = _bend_at(pos)
+			if not bend_hit.is_empty():
+				_select_bend(bend_hit["bend"], bend_hit["parent_array"], bend_hit["note"])
+				if bend_hit.get("tip", false):
+					_start_bend_tip_drag(bend_hit["start_beat"])
+				return
+			# Any other click clears the bend selection (note selection
+			# updates below as usual).
+			if _selected_bend != null:
+				_clear_bend_selection()
+				queue_redraw()
 			var hit: PatternNote = _note_at(pos)
 			if hit != null:
 				if event.shift_pressed:
@@ -360,6 +492,11 @@ func _handle_button(event: InputEventMouseButton) -> void:
 		else:
 			_end_drag()
 	elif event.button_index == MOUSE_BUTTON_RIGHT and event.pressed:
+		# Bends first (overlay on top of notes).
+		var bend_hit: Dictionary = _bend_at(pos)
+		if not bend_hit.is_empty():
+			_remove_bend(bend_hit["bend"], bend_hit["parent_array"])
+			return
 		var hit: PatternNote = _note_at(pos)
 		if hit != null:
 			_remove_note(hit)
@@ -367,6 +504,10 @@ func _handle_button(event: InputEventMouseButton) -> void:
 func _handle_motion(event: InputEventMouseMotion) -> void:
 	_last_mouse_pos = event.position
 	if _drag_state == DragState.IDLE:
+		var bend_hover: Dictionary = _bend_at(event.position)
+		if not bend_hover.is_empty():
+			mouse_default_cursor_shape = Control.CURSOR_POINTING_HAND if bend_hover.get("tip", false) else Control.CURSOR_ARROW
+			return
 		var hit: PatternNote = _note_at(event.position)
 		if hit != null and _near_right_edge(hit, event.position):
 			mouse_default_cursor_shape = Control.CURSOR_HSIZE
@@ -379,6 +520,10 @@ func _handle_motion(event: InputEventMouseMotion) -> void:
 		return
 	if _drag_state == DragState.SEEKING:
 		_update_seek(pos)
+		return
+	if _drag_state == DragState.BEND_TIP:
+		_update_bend_tip_drag(pos)
+		queue_redraw()
 		return
 	var min_dur: float = 1.0 / float(grid_subdivisions)
 	match _drag_state:
@@ -407,7 +552,10 @@ func _handle_key(event: InputEventKey) -> void:
 	if not event.pressed:
 		return
 	if event.keycode == KEY_DELETE or event.keycode == KEY_BACKSPACE:
-		_delete_selected()
+		if _selected_bend != null:
+			_remove_bend(_selected_bend, _selected_bend_parent_array)
+		else:
+			_delete_selected()
 		accept_event()
 		return
 	if event.ctrl_pressed or event.meta_pressed:
@@ -471,18 +619,78 @@ func _end_drag() -> void:
 	match _drag_state:
 		DragState.MARQUEE:
 			_commit_marquee()
-		DragState.CREATING, DragState.MOVING, DragState.RESIZING:
+		DragState.CREATING, DragState.MOVING, DragState.RESIZING, DragState.BEND_TIP:
 			pattern_changed.emit()
 	_drag_state = DragState.IDLE
 	_drag_note = null
+	_drag_bend = null
 	queue_redraw()
 
 func _remove_note(note: PatternNote) -> void:
 	pattern.notes.erase(note)
 	_selected.erase(note)
+	# If the deleted note owned the selected bend, clear bend selection too.
+	if _selected_bend_note == note:
+		_clear_bend_selection()
 	selection_changed.emit(_selected)
 	pattern_changed.emit()
 	queue_redraw()
+
+func _remove_bend(bend: PatternBend, parent_array: Array) -> void:
+	parent_array.erase(bend)
+	if _selected_bend == bend:
+		_clear_bend_selection()
+	pattern_changed.emit()
+	queue_redraw()
+
+## Programmatic API for the surrounding PatternEditor: append a new
+## PatternBend onto [param parent_array] with sensible defaults, select
+## it, and return it. The caller picks the parent (a PatternNote.bends
+## or another PatternBend.bends array) and a default target row.
+func add_bend(parent_array: Array, parent_note: PatternNote, default_target_index: int) -> PatternBend:
+	var b := PatternBend.create(0.0, 1.0 / float(grid_subdivisions), default_target_index, 0, 0.0)
+	parent_array.append(b)
+	_select_bend(b, parent_array, parent_note)
+	pattern_changed.emit()
+	queue_redraw()
+	return b
+
+func _select_bend(bend: PatternBend, parent_array: Array, note: PatternNote) -> void:
+	# Exclusive with note selection — picking a bend clears notes.
+	_selected.clear()
+	_selected_bend = bend
+	_selected_bend_parent_array = parent_array
+	_selected_bend_note = note
+	selection_changed.emit(_selected)
+	bend_selection_changed.emit(bend, note)
+	queue_redraw()
+
+func _clear_bend_selection() -> void:
+	_selected_bend = null
+	_selected_bend_parent_array = []
+	_selected_bend_note = null
+	bend_selection_changed.emit(null, null)
+
+func _start_bend_tip_drag(start_beat: float) -> void:
+	_drag_state = DragState.BEND_TIP
+	_drag_bend = _selected_bend
+	_drag_bend_parent_array = _selected_bend_parent_array
+	_drag_bend_note = _selected_bend_note
+	_drag_bend_start_beat = start_beat
+
+## Tip drag: cursor X → bend.glide_beats (snap to grid), cursor Y → bend.index.
+## Octave + accidental are NOT touched — those stay footer-only fine-grain
+## edits. glide_beats is clamped non-negative so the tip can't precede the
+## bend's start (offsets are edited in the footer or by dragging body —
+## not implemented in this pass).
+func _update_bend_tip_drag(pos: Vector2) -> void:
+	if _drag_bend == null:
+		return
+	var snapped_beat: float = _snap_beat(_x_to_beat(pos.x))
+	var new_glide: float = maxf(0.0, snapped_beat - _drag_bend_start_beat)
+	_drag_bend.glide_beats = new_glide
+	_drag_bend.index = clampi(_y_to_row(pos.y), min_row, max_row)
+	pattern_changed.emit()
 
 func _delete_selected() -> void:
 	if _selected.is_empty():
@@ -561,7 +769,16 @@ func _duplicate_selected() -> void:
 	queue_redraw()
 
 func _clone_note(n: PatternNote) -> PatternNote:
-	return PatternNote.create(n.beat, n.duration, n.index, n.octave, n.accidental, n.velocity)
+	var copy: PatternNote = PatternNote.create(n.beat, n.duration, n.index, n.octave, n.accidental, n.velocity)
+	for b in n.bends:
+		copy.bends.append(_clone_bend(b))
+	return copy
+
+func _clone_bend(b: PatternBend) -> PatternBend:
+	var copy: PatternBend = PatternBend.create(b.offset_beats, b.glide_beats, b.index, b.octave, b.accidental)
+	for child in b.bends:
+		copy.bends.append(_clone_bend(child))
+	return copy
 
 func _start_seek(pos: Vector2) -> void:
 	_drag_state = DragState.SEEKING

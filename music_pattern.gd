@@ -15,6 +15,6 @@ extends Resource
 @export var notes: Array[PatternNote] = []
 
 ## Chainable helper for building patterns in code.
-func add(p_beat: float, p_dur: float, p_index: int, p_oct: int = 0, p_acc: int = 0, p_vel: float = 0.8) -> MusicPattern:
+func add(p_beat: float, p_dur: float, p_index: int, p_oct: int = 0, p_acc: float = 0.0, p_vel: float = 0.8) -> MusicPattern:
 	notes.append(PatternNote.create(p_beat, p_dur, p_index, p_oct, p_acc, p_vel))
 	return self

@@ -132,17 +132,17 @@ func get_chord_tone(index: int, octave: int) -> int:
 	var extra_oct: int = int(floorf(float(index) / float(size)))
 	return 12 * (octave + 1 + extra_oct) + block.chord_root + intervals[idx]
 
-func get_scale_note(degree: int, octave: int, accidental: int = 0) -> int:
+func get_scale_note(degree: int, octave: int, accidental: float = 0.0) -> float:
 	var block := get_current_block()
 	if block == null:
-		return 60
+		return 60.0
 	var intervals := block.scale_intervals
 	var size: int = intervals.size()
 	if size == 0:
-		return 60
+		return 60.0
 	var idx: int = posmod(degree, size)
 	var extra_oct: int = int(floorf(float(degree) / float(size)))
-	return 12 * (octave + 1 + extra_oct) + block.scale_root + intervals[idx] + accidental
+	return float(12 * (octave + 1 + extra_oct) + block.scale_root + intervals[idx]) + accidental
 
 ## Apply swing to a beat position. Offbeat 8th notes (0.5, 1.5, 2.5, ...)
 ## are shifted forward by up to half an 8th note's duration.

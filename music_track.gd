@@ -129,6 +129,11 @@ var _local_time: float = 0.0
 var _prev_cursor: float = -0.001
 # Each entry: {"midi": int, "off_time": float} (off_time in effective beats)
 var _active_notes: Array = []
+# Each entry: {"midi": int, "fire_beat": float, "target_freq": float,
+# "glide_beats": float}. Bends pulled from triggered notes' bend chains;
+# fire when effective >= fire_beat, then dispatched to SynthEngine.bend_to.
+# Cancelled on note-off, _release_all, and block changes.
+var _pending_bends: Array = []
 # Counter for play_once() to invalidate stale deferred deactivates when
 # the same track is re-triggered rapidly.
 var _play_once_token: int = 0
@@ -275,8 +280,24 @@ func _process(delta: float) -> void:
 		var entry: Dictionary = _active_notes[i]
 		if effective >= entry["off_time"]:
 			synth.note_off(synth_channel, entry["midi"])
+			_cancel_pending_bends(entry["midi"])
 			_active_notes.remove_at(i)
 		i -= 1
+
+	# Fire bends whose scheduled beat has arrived.
+	if not _pending_bends.is_empty():
+		var bpm: float = _effective_bpm()
+		var bi: int = _pending_bends.size() - 1
+		while bi >= 0:
+			var be: Dictionary = _pending_bends[bi]
+			if effective >= float(be["fire_beat"]):
+				var glide_seconds: float = 0.0
+				if bpm > 0.0:
+					glide_seconds = float(be["glide_beats"]) * 60.0 / bpm
+				synth.bend_to(synth_channel, int(be["midi"]),
+					float(be["target_freq"]), glide_seconds)
+				_pending_bends.remove_at(bi)
+			bi -= 1
 
 	if pattern == null or pattern.notes.is_empty():
 		return
@@ -378,42 +399,81 @@ func _sync_cursor_to_now() -> void:
 # ---------------------------------------------------------------------------
 
 func _trigger_note(note: PatternNote, effective_beats: float) -> void:
-	var midi: int = _resolve_midi(note)
-	synth.note_on(synth_channel, midi, clampf(note.velocity * velocity_scale, 0.0, 1.0), pan)
-	_active_notes.append({"midi": midi, "off_time": effective_beats + note.duration})
+	var midi_float: float = _resolve_midi_float(note.index, note.octave, note.accidental)
+	var midi_handle: int = roundi(midi_float)
+	synth.note_on(synth_channel, midi_float, clampf(note.velocity * velocity_scale, 0.0, 1.0), pan)
+	_active_notes.append({"midi": midi_handle, "off_time": effective_beats + note.duration})
+	if not note.bends.is_empty():
+		_schedule_bends(midi_handle, effective_beats, note.bends, 0.0)
 
-func _resolve_midi(note: PatternNote) -> int:
+## Append every bend in [param bends] (and their nested children) to
+## [_pending_bends] with absolute fire beats. [param parent_offset] is the
+## accumulated offset of this bend's parent within the bend chain — child
+## bends fire at parent_start_beat + parent_offset + bend.offset_beats,
+## so each nested bend's offset_beats stays "relative to its own parent".
+func _schedule_bends(midi_handle: int, parent_start_beat: float, bends: Array[PatternBend], parent_offset: float) -> void:
+	for b in bends:
+		var fire_beat: float = parent_start_beat + parent_offset + b.offset_beats
+		var target_midi: float = _resolve_midi_float(b.index, b.octave, b.accidental)
+		var target_freq: float = 440.0 * pow(2.0, (target_midi - 69.0) / 12.0)
+		_pending_bends.append({
+			"midi": midi_handle,
+			"fire_beat": fire_beat,
+			"target_freq": target_freq,
+			"glide_beats": b.glide_beats,
+		})
+		if not b.bends.is_empty():
+			_schedule_bends(midi_handle, parent_start_beat, b.bends, parent_offset + b.offset_beats)
+
+func _cancel_pending_bends(midi_handle: int) -> void:
+	var i: int = _pending_bends.size() - 1
+	while i >= 0:
+		if int(_pending_bends[i]["midi"]) == midi_handle:
+			_pending_bends.remove_at(i)
+		i -= 1
+
+func _effective_bpm() -> float:
+	if bpm_override > 0.0:
+		return bpm_override
+	if director != null and director.data != null:
+		return director.data.bpm
+	return 120.0
+
+## Resolve a (index, octave, accidental) triple to a fractional MIDI number
+## in the current block's harmonic context. Returns float so microtonal
+## accidentals (e.g. 0.5) flow through unrounded.
+func _resolve_midi_float(p_index: int, p_octave: int, p_accidental: float) -> float:
 	match track_type:
 		TrackType.CHORD:
-			return _resolve_chord(note)
+			return _resolve_chord_float(p_index, p_octave)
 		TrackType.MELODY:
-			return _resolve_melody(note)
-		_: # DRUM
-			return note.index
+			return _resolve_melody_float(p_index, p_octave, p_accidental)
+		_: # DRUM — index is absolute MIDI
+			return float(p_index)
 
-func _resolve_chord(note: PatternNote) -> int:
+func _resolve_chord_float(p_index: int, p_octave: int) -> float:
 	var block := _effective_block()
 	if block == null:
-		return 60
+		return 60.0
 	var intervals := block.chord_intervals
 	var size: int = intervals.size()
 	if size == 0:
-		return 60
-	var idx: int = posmod(note.index, size)
-	var extra_oct: int = int(floorf(float(note.index) / float(size)))
-	return 12 * (base_octave + 1 + note.octave + extra_oct) + block.chord_root + intervals[idx]
+		return 60.0
+	var idx: int = posmod(p_index, size)
+	var extra_oct: int = int(floorf(float(p_index) / float(size)))
+	return float(12 * (base_octave + 1 + p_octave + extra_oct) + block.chord_root + intervals[idx])
 
-func _resolve_melody(note: PatternNote) -> int:
+func _resolve_melody_float(p_index: int, p_octave: int, p_accidental: float) -> float:
 	var block := _effective_block()
 	if block == null:
-		return 60
+		return 60.0
 	var intervals := block.scale_intervals
 	var size: int = intervals.size()
 	if size == 0:
-		return 60
-	var idx: int = posmod(note.index, size)
-	var extra_oct: int = int(floorf(float(note.index) / float(size)))
-	return 12 * (base_octave + 1 + note.octave + extra_oct) + block.scale_root + intervals[idx] + note.accidental
+		return 60.0
+	var idx: int = posmod(p_index, size)
+	var extra_oct: int = int(floorf(float(p_index) / float(size)))
+	return float(12 * (base_octave + 1 + p_octave + extra_oct) + block.scale_root + intervals[idx]) + p_accidental
 
 # ---------------------------------------------------------------------------
 # Signal handlers
@@ -439,3 +499,4 @@ func _release_all() -> void:
 	for entry in _active_notes:
 		synth.note_off(synth_channel, entry["midi"])
 	_active_notes.clear()
+	_pending_bends.clear()

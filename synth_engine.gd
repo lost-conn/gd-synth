@@ -68,6 +68,13 @@ class Voice:
 	var noise_hp_state: float = 0.0
 	# Stereo pan (-1 = full left, 0 = center, +1 = full right)
 	var pan: float = 0.0
+	# Pitch glide (bend) state. samples_left > 0 means an active glide:
+	# multiply freq by glide_factor each sample until samples_left hits 0,
+	# then snap to glide_target_freq to absorb FP drift. Cheap by design —
+	# one mul + one decrement per active voice per sample.
+	var glide_samples_left: int = 0
+	var glide_factor: float = 1.0
+	var glide_target_freq: float = 0.0
 
 # One AudioStreamPlayer per channel (0..15), each routable to its own
 # audio bus so users can attach Godot's built-in effects (reverb, delay,
@@ -199,19 +206,26 @@ func set_patch(channel: int, patch: SynthPatch) -> void:
 		return
 	_patches[channel] = patch
 
-func note_on(channel: int, note: int, velocity: float = 1.0, pan: float = 0.0) -> void:
+## Trigger a note on [param channel]. [param note] is a MIDI number,
+## accepted as float so microtonal pitches (e.g. 60.5) work end-to-end.
+## The integer part (rounded) is used as the lookup key for [method note_off]
+## and [method bend_to]; the fractional part feeds frequency.
+func note_on(channel: int, note: float, velocity: float = 1.0, pan: float = 0.0) -> void:
 	var v := _allocate_voice()
 	var patch: SynthPatch = _patches[channel]
 	_age_counter += 1
 	v.active = true
 	v.released = false
 	v.channel = channel
-	v.note = note
-	var effective_freq: float = 440.0 * pow(2.0, (note - 69) / 12.0)
+	v.note = roundi(note)
+	var effective_freq: float = 440.0 * pow(2.0, (note - 69.0) / 12.0)
 	if patch.pitch_randomize_cents > 0.0:
 		var cents: float = (randf() * 2.0 - 1.0) * patch.pitch_randomize_cents
 		effective_freq *= pow(2.0, cents / 1200.0)
 	v.freq = effective_freq
+	v.glide_samples_left = 0
+	v.glide_factor = 1.0
+	v.glide_target_freq = effective_freq
 	var eff_vel: float = clamp(velocity, 0.0, 1.0)
 	if patch.velocity_randomize > 0.0:
 		eff_vel *= lerpf(1.0 - patch.velocity_randomize, 1.0, randf())
@@ -249,6 +263,37 @@ func note_off(channel: int, note: int) -> void:
 			v.fenv_state = ENV_RELEASE
 			v.fenv_release_start = v.fenv_value
 			return
+
+## Glide the live voice on (channel, source_midi) from its current pitch
+## to [param target_freq] over [param glide_seconds]. Picks the newest
+## unreleased matching voice. No-op if no voice matches. The glide
+## composes naturally with vibrato + pitch_decay — they multiply against
+## the gliding base freq each sample.
+##
+## glide_seconds <= 0 snaps immediately. Stacks: calling bend_to again
+## mid-glide picks up from the current (mid-glide) pitch.
+func bend_to(channel: int, source_midi: int, target_freq: float, glide_seconds: float) -> void:
+	var voice: Voice = null
+	var newest_age: int = -1
+	for v in _voices:
+		if v.active and not v.released and v.channel == channel and v.note == source_midi:
+			if v.age > newest_age:
+				newest_age = v.age
+				voice = v
+	if voice == null:
+		return
+	var safe_target: float = maxf(target_freq, 0.0001)
+	if glide_seconds <= 0.0 or voice.freq <= 0.0:
+		voice.freq = safe_target
+		voice.glide_target_freq = safe_target
+		voice.glide_samples_left = 0
+		return
+	var samples: int = maxi(1, int(glide_seconds * mix_rate))
+	voice.glide_samples_left = samples
+	voice.glide_target_freq = safe_target
+	# Per-sample multiplicative step in log-frequency space — one mul/sample.
+	var ratio: float = safe_target / voice.freq
+	voice.glide_factor = pow(ratio, 1.0 / float(samples))
 
 func all_notes_off() -> void:
 	for v in _voices:
@@ -395,6 +440,15 @@ func _render_voice(v: Voice, dt: float) -> float:
 					v.fenv_value -= dt * v.fenv_release_start / p.filter_release
 				if v.fenv_value < 0.0:
 					v.fenv_value = 0.0
+
+	# --- Pitch glide (bend) ---------------------------------------------
+	# Mutates the voice's base freq in place so subsequent vibrato +
+	# pitch_decay modulators stack on top of the gliding pitch.
+	if v.glide_samples_left > 0:
+		v.freq *= v.glide_factor
+		v.glide_samples_left -= 1
+		if v.glide_samples_left == 0:
+			v.freq = v.glide_target_freq
 
 	# --- Pitch + vibrato + pitch envelope --------------------------------
 	var freq := v.freq

@@ -26,13 +26,19 @@ extends Resource
 @export var octave: int = 0
 
 ## Chromatic alteration in semitones (melody only). +1 raises, -1 lowers.
+## Float so microtonal targets are expressible (e.g. 0.5 = quarter-tone).
 ## Enables chromatic passing tones without switching scales.
-@export var accidental: int = 0
+@export var accidental: float = 0.0
 
 ## Note velocity (0..1), forwarded to SynthEngine as the attack amplitude.
 @export_range(0.0, 1.0) var velocity: float = 0.8
 
-static func create(p_beat: float, p_dur: float, p_index: int, p_oct: int = 0, p_acc: int = 0, p_vel: float = 0.8) -> PatternNote:
+## Pitch glides chained off this note. Each fires at its own scheduled
+## time and commands the live voice to slide to a new pitch. See
+## [PatternBend].
+@export var bends: Array[PatternBend] = []
+
+static func create(p_beat: float, p_dur: float, p_index: int, p_oct: int = 0, p_acc: float = 0.0, p_vel: float = 0.8) -> PatternNote:
 	var n := PatternNote.new()
 	n.beat = p_beat
 	n.duration = p_dur
