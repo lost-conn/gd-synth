@@ -242,7 +242,7 @@ func _draw_notes() -> void:
 		fill.a = lerpf(0.45, 1.0, note.velocity)
 		draw_rect(rect, fill)
 		draw_rect(rect, NOTE_BORDER, false, 1.0)
-		if track_type == MusicTrack.TrackType.MELODY and note.accidental != 0:
+		if track_type != MusicTrack.TrackType.DRUM and note.accidental != 0:
 			var sym: String = "#" if note.accidental > 0 else "b"
 			draw_string(_font, Vector2(rect.position.x + 3.0, rect.end.y - 3.0), sym,
 				HORIZONTAL_ALIGNMENT_LEFT, rect.size.x, 10, ACCIDENTAL_COLOR)
@@ -280,7 +280,7 @@ func _bend_anchor(beat: float, row_index: int, accidental: float) -> Vector2:
 	# tracks visualize accidental — for CHORD/DRUM the shift is zero so
 	# this is harmless).
 	var y: float = _row_y(row_index) + row_height * 0.5
-	if track_type == MusicTrack.TrackType.MELODY:
+	if track_type != MusicTrack.TrackType.DRUM:
 		y -= accidental * row_height * ACCIDENTAL_SHIFT
 	return Vector2(x, y)
 
@@ -356,7 +356,7 @@ func _note_rect(note: PatternNote) -> Rect2:
 	var x: float = GUTTER_WIDTH + note.beat * beat_width
 	var w: float = maxf(2.0, note.duration * beat_width)
 	var shift: float = 0.0
-	if track_type == MusicTrack.TrackType.MELODY:
+	if track_type != MusicTrack.TrackType.DRUM:
 		shift = -float(note.accidental) * row_height * ACCIDENTAL_SHIFT
 	return Rect2(x, y + shift + 1.0, w, row_height - 2.0)
 

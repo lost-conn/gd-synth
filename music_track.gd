@@ -445,13 +445,13 @@ func _effective_bpm() -> float:
 func _resolve_midi_float(p_index: int, p_octave: int, p_accidental: float) -> float:
 	match track_type:
 		TrackType.CHORD:
-			return _resolve_chord_float(p_index, p_octave)
+			return _resolve_chord_float(p_index, p_octave, p_accidental)
 		TrackType.MELODY:
 			return _resolve_melody_float(p_index, p_octave, p_accidental)
 		_: # DRUM — index is absolute MIDI
 			return float(p_index)
 
-func _resolve_chord_float(p_index: int, p_octave: int) -> float:
+func _resolve_chord_float(p_index: int, p_octave: int, p_accidental: float) -> float:
 	var block := _effective_block()
 	if block == null:
 		return 60.0
@@ -461,7 +461,7 @@ func _resolve_chord_float(p_index: int, p_octave: int) -> float:
 		return 60.0
 	var idx: int = posmod(p_index, size)
 	var extra_oct: int = int(floorf(float(p_index) / float(size)))
-	return float(12 * (base_octave + 1 + p_octave + extra_oct) + block.chord_root + intervals[idx])
+	return float(12 * (base_octave + 1 + p_octave + extra_oct) + block.chord_root + intervals[idx]) + p_accidental
 
 func _resolve_melody_float(p_index: int, p_octave: int, p_accidental: float) -> float:
 	var block := _effective_block()
