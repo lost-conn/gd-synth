@@ -27,6 +27,11 @@ extends Node
 ## via tween. Voices are clipped to [-1, 1] after this multiplication.
 @export_range(0.0, 1.0) var master_gain: float = 0.6
 
+## Equal-loudness compensation strength. Applies a -3 dB/octave tilt
+## (relative to A4 = 440 Hz) so low notes aren't perceptually quieter
+## than highs at the same velocity. 0 = off, 1 = full compensation.
+@export_range(0.0, 1.0) var loudness_compensation: float = 1.0
+
 const ENV_ATTACK := 0
 const ENV_DECAY := 1
 const ENV_SUSTAIN := 2
@@ -75,6 +80,9 @@ class Voice:
 	var glide_samples_left: int = 0
 	var glide_factor: float = 1.0
 	var glide_target_freq: float = 0.0
+	# Equal-loudness gain factor, computed once at note-on from the voice's
+	# initial frequency. sqrt(440 / freq) gives -3 dB/octave relative to A4.
+	var loudness_comp: float = 1.0
 
 # One AudioStreamPlayer per channel (0..15), each routable to its own
 # audio bus so users can attach Godot's built-in effects (reverb, delay,
@@ -247,6 +255,10 @@ func note_on(channel: int, note: float, velocity: float = 1.0, pan: float = 0.0)
 	v.noise_env = 1.0
 	v.noise_lp_state = 0.0
 	v.noise_hp_state = 0.0
+	if loudness_compensation > 0.0 and effective_freq > 0.0:
+		v.loudness_comp = lerpf(1.0, clampf(sqrt(440.0 / effective_freq), 0.25, 3.0), loudness_compensation)
+	else:
+		v.loudness_comp = 1.0
 	var dv := patch.detune_voices
 	if dv > 1:
 		v.detune_phase = PackedFloat32Array()
@@ -526,7 +538,7 @@ func _render_voice(v: Voice, dt: float) -> float:
 			SynthPatch.FilterType.BANDPASS:
 				sample = v1
 
-	sample *= v.env_value * v.velocity * p.gain
+	sample *= v.env_value * v.velocity * p.gain * v.loudness_comp
 
 	# --- Legacy one-pole lowpass (post-amp) -----------------------------
 	if p.lowpass < 1.0:
