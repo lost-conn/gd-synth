@@ -58,10 +58,6 @@ enum FilterType { OFF, LOWPASS, HIGHPASS, BANDPASS }
 
 @export_group("Filter & Gain")
 
-## One-pole lowpass cutoff coefficient. 1.0 = pass-through (no filter);
-## lower values muffle high frequencies. Cheap but effective.
-@export_range(0.0, 1.0) var lowpass: float = 1.0
-
 ## Per-patch output level. Stacks with [SynthEngine.master_gain].
 @export var gain: float = 0.5
 
@@ -239,7 +235,8 @@ static func make_clarinet() -> SynthPatch:
 	p.decay = 0.1
 	p.sustain = 0.85
 	p.release = 0.2
-	p.lowpass = 0.6
+	p.filter_type = FilterType.LOWPASS
+	p.filter_cutoff = 0.7354
 	p.gain = 0.4
 	p.rebuild()
 	return p
@@ -266,7 +263,8 @@ static func make_pad() -> SynthPatch:
 	p.decay = 0.4
 	p.sustain = 0.8
 	p.release = 1.2
-	p.lowpass = 0.4
+	p.filter_type = FilterType.LOWPASS
+	p.filter_cutoff = 0.6508
 	p.detune_voices = 3
 	p.detune_cents = 8.0
 	p.vibrato_rate = 4.5
@@ -283,7 +281,8 @@ static func make_bass() -> SynthPatch:
 	p.decay = 0.2
 	p.sustain = 0.6
 	p.release = 0.1
-	p.lowpass = 0.35
+	p.filter_type = FilterType.LOWPASS
+	p.filter_cutoff = 0.6262
 	p.gain = 0.5
 	p.rebuild()
 	return p
@@ -315,7 +314,8 @@ static func make_snare() -> SynthPatch:
 	p.release = 0.05
 	p.pitch_decay_semitones = 24.0
 	p.pitch_decay_time = 0.04
-	p.lowpass = 0.5
+	p.filter_type = FilterType.LOWPASS
+	p.filter_cutoff = 0.695
 	p.gain = 0.5
 	p.rebuild()
 	return p
@@ -329,7 +329,8 @@ static func make_hihat() -> SynthPatch:
 	p.decay = 0.06
 	p.sustain = 0.0
 	p.release = 0.03
-	p.lowpass = 0.7
+	p.filter_type = FilterType.LOWPASS
+	p.filter_cutoff = 0.7749
 	p.gain = 0.35
 	p.rebuild()
 	return p

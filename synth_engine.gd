@@ -50,7 +50,6 @@ class Voice:
 	var env_state: int = 0
 	var env_value: float = 0.0
 	var release_start: float = 1.0
-	var lp_state: float = 0.0
 	var pitch_time: float = 0.0
 	var age: int = 0
 	# FM modulator state
@@ -99,11 +98,13 @@ var _default_patch: SynthPatch
 var _age_counter: int = 0
 var _lfo_time: float = 0.0
 
-# Flat mixdown buffer: index = channel * frames + sample_index.
-# Stored as a member to avoid aliasing (PackedArrays stored in a containing
-# Array trigger copy-on-write on subscript mutation; direct member access
-# stays at refcount=1 so writes are in-place.
-var _mixdown: PackedVector2Array = PackedVector2Array()
+# Flat mixdown buffers, split L/R: index = channel * frames + sample_index.
+# Two PackedFloat32Arrays instead of one PackedVector2Array so the per-sample
+# accumulate is a plain float += with no Variant/Vector2 boxing. Stored as
+# members to avoid copy-on-write (direct member access stays at refcount=1 so
+# writes are in-place).
+var _mix_l: PackedFloat32Array = PackedFloat32Array()
+var _mix_r: PackedFloat32Array = PackedFloat32Array()
 var _push_buf: PackedVector2Array = PackedVector2Array()
 
 const CHANNEL_COUNT := 16
@@ -243,7 +244,6 @@ func note_on(channel: int, note: float, velocity: float = 1.0, pan: float = 0.0)
 	v.phase = 0.0
 	v.env_state = ENV_ATTACK
 	v.env_value = 0.0
-	v.lp_state = 0.0
 	v.pitch_time = 0.0
 	v.age = _age_counter
 	v.mod_phase = 0.0
@@ -333,30 +333,27 @@ func _process(_delta: float) -> void:
 		return
 	var dt := 1.0 / mix_rate
 
-	# Precompute expensive SVF coefficients once per buffer (tan + pow).
-	for v in _voices:
-		if v.active and v.patch != null and v.patch.filter_type != SynthPatch.FilterType.OFF:
-			_update_svf_coefs(v, v.patch)
-
-	# Resize + zero the flat mixdown buffer.
+	# Resize + zero the flat L/R mixdown buffers.
 	var total_frames := CHANNEL_COUNT * frames
-	if _mixdown.size() != total_frames:
-		_mixdown.resize(total_frames)
-	_mixdown.fill(Vector2.ZERO)
+	if _mix_l.size() != total_frames:
+		_mix_l.resize(total_frames)
+		_mix_r.resize(total_frames)
+	_mix_l.fill(0.0)
+	_mix_r.fill(0.0)
 
-	# Render all voices, accumulate to their channel's slice of the buffer.
-	for i in frames:
-		_lfo_time += dt
-		for v in _voices:
-			if v.active:
-				var s := _render_voice(v, dt)
-				var l: float = s * (1.0 - maxf(v.pan, 0.0))
-				var r: float = s * (1.0 + minf(v.pan, 0.0))
-				var idx: int = v.channel * frames + i
-				var cur: Vector2 = _mixdown[idx]
-				_mixdown[idx] = Vector2(cur.x + l, cur.y + r)
+	# Voice-major render: each active voice fills its whole channel slice in one
+	# call. Per-patch branch decisions are hoisted out of the per-sample loop
+	# inside _render_voice_block, and there's no per-sample function-call
+	# boundary — the two big wins over the old sample-major loop. The vibrato
+	# LFO advances from a captured base so all voices see the same clock as the
+	# old loop did; advance the shared clock once after rendering.
+	var lfo_base := _lfo_time
+	for v in _voices:
+		if v.active:
+			_render_voice_block(v, frames, dt, lfo_base)
+	_lfo_time = lfo_base + frames * dt
 
-	# Per-channel: apply master gain, clip, push to that channel's player.
+	# Per-channel: apply master gain, clip, interleave, push to the player.
 	if _push_buf.size() != frames:
 		_push_buf.resize(frames)
 	for ch in CHANNEL_COUNT:
@@ -365,12 +362,13 @@ func _process(_delta: float) -> void:
 			continue
 		var base := ch * frames
 		for i in frames:
-			var s: Vector2 = _mixdown[base + i] * master_gain
-			if s.x > 1.0: s.x = 1.0
-			elif s.x < -1.0: s.x = -1.0
-			if s.y > 1.0: s.y = 1.0
-			elif s.y < -1.0: s.y = -1.0
-			_push_buf[i] = s
+			var lx: float = _mix_l[base + i] * master_gain
+			var rx: float = _mix_r[base + i] * master_gain
+			if lx > 1.0: lx = 1.0
+			elif lx < -1.0: lx = -1.0
+			if rx > 1.0: rx = 1.0
+			elif rx < -1.0: rx = -1.0
+			_push_buf[i] = Vector2(lx, rx)
 		playback.push_buffer(_push_buf)
 
 func _update_svf_coefs(v: Voice, p: SynthPatch) -> void:
@@ -388,161 +386,188 @@ func _update_svf_coefs(v: Voice, p: SynthPatch) -> void:
 	v.svf_a3 = g * v.svf_a2
 	v.svf_k = k
 
-func _render_voice(v: Voice, dt: float) -> float:
+func _render_voice_block(v: Voice, frames: int, dt: float, lfo_base: float) -> void:
 	var p: SynthPatch = v.patch
+	if p == null:
+		return
+	var base: int = v.channel * frames
 
-	# --- Amp envelope ---------------------------------------------------
-	match v.env_state:
-		ENV_ATTACK:
-			if p.attack <= 0.0:
-				v.env_value = 1.0
-				v.env_state = ENV_DECAY
-			else:
-				v.env_value += dt / p.attack
-				if v.env_value >= 1.0:
+	# --- Per-buffer invariants (hoisted out of the per-sample loop) ------
+	# Pan gains and the constant part of the amp scale never change within a
+	# buffer; the only per-sample amp factor is env_value.
+	var l_gain: float = 1.0 - maxf(v.pan, 0.0)
+	var r_gain: float = 1.0 + minf(v.pan, 0.0)
+	var amp_scale: float = v.velocity * p.gain * v.loudness_comp
+
+	# Feature flags decided once per buffer so disabled features cost nothing
+	# per sample.
+	var has_filter: bool = p.filter_type != SynthPatch.FilterType.OFF
+	var filter_type: int = p.filter_type
+	var has_fm: bool = p.fm_index > 0.0
+	var has_vibrato: bool = p.vibrato_depth_cents > 0.0 and p.vibrato_rate > 0.0
+	var has_pitch_decay: bool = p.pitch_decay_semitones > 0.0 and p.pitch_decay_time > 0.0
+	var has_noise: bool = p.noise_mix > 0.0
+	var noise_full: bool = p.noise_mix >= 1.0
+	var dv: int = p.detune_voices
+	var inv_count: float = 1.0 / float(dv) if dv > 1 else 1.0
+
+	# SVF coefficients: once per buffer (uses fenv_value carried from the prior
+	# buffer's end), matching the original cadence — the filter cutoff envelope
+	# is already control-rate at the coefficient level.
+	if has_filter:
+		_update_svf_coefs(v, p)
+
+	var lfo_t: float = lfo_base
+	for i in frames:
+		lfo_t += dt
+
+		# --- Amp envelope -----------------------------------------------
+		match v.env_state:
+			ENV_ATTACK:
+				if p.attack <= 0.0:
 					v.env_value = 1.0
 					v.env_state = ENV_DECAY
-		ENV_DECAY:
-			if p.decay <= 0.0:
-				v.env_value = p.sustain
-				v.env_state = ENV_SUSTAIN
-			else:
-				v.env_value -= dt * (1.0 - p.sustain) / p.decay
-				if v.env_value <= p.sustain:
+				else:
+					v.env_value += dt / p.attack
+					if v.env_value >= 1.0:
+						v.env_value = 1.0
+						v.env_state = ENV_DECAY
+			ENV_DECAY:
+				if p.decay <= 0.0:
 					v.env_value = p.sustain
 					v.env_state = ENV_SUSTAIN
-		ENV_SUSTAIN:
-			pass
-		ENV_RELEASE:
-			if p.release <= 0.0:
-				v.env_value = 0.0
-			else:
-				v.env_value -= dt * v.release_start / p.release
-			if v.env_value <= 0.0:
-				v.active = false
-				return 0.0
-
-	# --- Filter envelope (only when filter is enabled) ------------------
-	if p.filter_type != SynthPatch.FilterType.OFF:
-		match v.fenv_state:
-			ENV_ATTACK:
-				if p.filter_attack <= 0.0:
-					v.fenv_value = 1.0
-					v.fenv_state = ENV_DECAY
 				else:
-					v.fenv_value += dt / p.filter_attack
-					if v.fenv_value >= 1.0:
-						v.fenv_value = 1.0
-						v.fenv_state = ENV_DECAY
-			ENV_DECAY:
-				if p.filter_decay <= 0.0:
-					v.fenv_value = p.filter_sustain
-					v.fenv_state = ENV_SUSTAIN
-				else:
-					v.fenv_value -= dt * (1.0 - p.filter_sustain) / p.filter_decay
-					if v.fenv_value <= p.filter_sustain:
-						v.fenv_value = p.filter_sustain
-						v.fenv_state = ENV_SUSTAIN
+					v.env_value -= dt * (1.0 - p.sustain) / p.decay
+					if v.env_value <= p.sustain:
+						v.env_value = p.sustain
+						v.env_state = ENV_SUSTAIN
 			ENV_SUSTAIN:
 				pass
 			ENV_RELEASE:
-				if p.filter_release <= 0.0:
-					v.fenv_value = 0.0
+				if p.release <= 0.0:
+					v.env_value = 0.0
 				else:
-					v.fenv_value -= dt * v.fenv_release_start / p.filter_release
-				if v.fenv_value < 0.0:
-					v.fenv_value = 0.0
+					v.env_value -= dt * v.release_start / p.release
+				if v.env_value <= 0.0:
+					# Voice died mid-buffer; remaining samples stay zero.
+					v.active = false
+					return
 
-	# --- Pitch glide (bend) ---------------------------------------------
-	# Mutates the voice's base freq in place so subsequent vibrato +
-	# pitch_decay modulators stack on top of the gliding pitch.
-	if v.glide_samples_left > 0:
-		v.freq *= v.glide_factor
-		v.glide_samples_left -= 1
-		if v.glide_samples_left == 0:
-			v.freq = v.glide_target_freq
+		# --- Filter envelope (only when filter is enabled) --------------
+		if has_filter:
+			match v.fenv_state:
+				ENV_ATTACK:
+					if p.filter_attack <= 0.0:
+						v.fenv_value = 1.0
+						v.fenv_state = ENV_DECAY
+					else:
+						v.fenv_value += dt / p.filter_attack
+						if v.fenv_value >= 1.0:
+							v.fenv_value = 1.0
+							v.fenv_state = ENV_DECAY
+				ENV_DECAY:
+					if p.filter_decay <= 0.0:
+						v.fenv_value = p.filter_sustain
+						v.fenv_state = ENV_SUSTAIN
+					else:
+						v.fenv_value -= dt * (1.0 - p.filter_sustain) / p.filter_decay
+						if v.fenv_value <= p.filter_sustain:
+							v.fenv_value = p.filter_sustain
+							v.fenv_state = ENV_SUSTAIN
+				ENV_SUSTAIN:
+					pass
+				ENV_RELEASE:
+					if p.filter_release <= 0.0:
+						v.fenv_value = 0.0
+					else:
+						v.fenv_value -= dt * v.fenv_release_start / p.filter_release
+					if v.fenv_value < 0.0:
+						v.fenv_value = 0.0
 
-	# --- Pitch + vibrato + pitch envelope --------------------------------
-	var freq := v.freq
-	if p.vibrato_depth_cents > 0.0 and p.vibrato_rate > 0.0:
-		var lfo := sin(_lfo_time * TAU * p.vibrato_rate)
-		freq *= pow(2.0, (lfo * p.vibrato_depth_cents) / 1200.0)
-	if p.pitch_decay_semitones > 0.0 and p.pitch_decay_time > 0.0:
-		var t: float = clampf(v.pitch_time / p.pitch_decay_time, 0.0, 1.0)
-		var semis: float = p.pitch_decay_semitones * (1.0 - t)
-		freq *= pow(2.0, semis / 12.0)
-		v.pitch_time += dt
+		# --- Pitch glide (bend) -----------------------------------------
+		# Mutates the voice's base freq in place so subsequent vibrato +
+		# pitch_decay modulators stack on top of the gliding pitch.
+		if v.glide_samples_left > 0:
+			v.freq *= v.glide_factor
+			v.glide_samples_left -= 1
+			if v.glide_samples_left == 0:
+				v.freq = v.glide_target_freq
 
-	# --- FM modulator (single operator, sine modulator) -----------------
-	var fm_offset: float = 0.0
-	if p.fm_index > 0.0:
-		var mod_freq: float = freq * p.fm_ratio
-		v.mod_phase += mod_freq * dt
-		if v.mod_phase >= 1.0:
-			v.mod_phase -= floor(v.mod_phase)
-		fm_offset = sin(v.mod_phase * TAU) * p.fm_index
+		# --- Pitch + vibrato + pitch envelope ----------------------------
+		var freq := v.freq
+		if has_vibrato:
+			var lfo := sin(lfo_t * TAU * p.vibrato_rate)
+			freq *= pow(2.0, (lfo * p.vibrato_depth_cents) / 1200.0)
+		if has_pitch_decay:
+			var t: float = clampf(v.pitch_time / p.pitch_decay_time, 0.0, 1.0)
+			var semis: float = p.pitch_decay_semitones * (1.0 - t)
+			freq *= pow(2.0, semis / 12.0)
+			v.pitch_time += dt
 
-	# --- Oscillator (mono or detuned unison) ----------------------------
-	var sample := 0.0
-	var dv := p.detune_voices
-	if dv <= 1:
-		sample = p.sample(fposmod(v.phase + fm_offset, 1.0))
-		v.phase += freq * dt
-		if v.phase >= 1.0:
-			v.phase -= floor(v.phase)
-	else:
-		var inv_count: float = 1.0 / float(dv)
-		for i in dv:
-			var t: float = 0.5
-			if dv > 1:
-				t = float(i) / float(dv - 1)
-			var cents: float = lerpf(-p.detune_cents, p.detune_cents, t)
-			var f: float = freq * pow(2.0, cents / 1200.0)
-			sample += p.sample(fposmod(v.detune_phase[i] + fm_offset, 1.0))
-			var ph: float = v.detune_phase[i] + f * dt
-			if ph >= 1.0:
-				ph -= floor(ph)
-			v.detune_phase[i] = ph
-		sample *= inv_count
+		# --- FM modulator (single operator, sine modulator) -------------
+		var fm_offset: float = 0.0
+		if has_fm:
+			var mod_freq: float = freq * p.fm_ratio
+			v.mod_phase += mod_freq * dt
+			if v.mod_phase >= 1.0:
+				v.mod_phase -= floor(v.mod_phase)
+			fm_offset = sin(v.mod_phase * TAU) * p.fm_index
 
-	# --- Noise (filtered, with independent decay envelope) --------------
-	if p.noise_mix > 0.0:
-		var noise: float = randf() * 2.0 - 1.0
-		if p.noise_lowpass < 1.0:
-			v.noise_lp_state += p.noise_lowpass * (noise - v.noise_lp_state)
-			noise = v.noise_lp_state
-		if p.noise_highpass > 0.0:
-			v.noise_hp_state += p.noise_highpass * (noise - v.noise_hp_state)
-			noise -= v.noise_hp_state
-		if p.noise_decay > 0.0 and v.noise_env > 0.0:
-			v.noise_env -= dt / p.noise_decay
-			if v.noise_env < 0.0:
-				v.noise_env = 0.0
-		if p.noise_mix >= 1.0:
-			sample = noise * v.noise_env
+		# --- Oscillator (mono or detuned unison) ------------------------
+		var sample := 0.0
+		if dv <= 1:
+			sample = p.sample(fposmod(v.phase + fm_offset, 1.0))
+			v.phase += freq * dt
+			if v.phase >= 1.0:
+				v.phase -= floor(v.phase)
 		else:
-			sample = sample * (1.0 - p.noise_mix) + noise * p.noise_mix * v.noise_env
+			for j in dv:
+				var t: float = 0.5
+				if dv > 1:
+					t = float(j) / float(dv - 1)
+				var cents: float = lerpf(-p.detune_cents, p.detune_cents, t)
+				var f: float = freq * pow(2.0, cents / 1200.0)
+				sample += p.sample(fposmod(v.detune_phase[j] + fm_offset, 1.0))
+				var ph: float = v.detune_phase[j] + f * dt
+				if ph >= 1.0:
+					ph -= floor(ph)
+				v.detune_phase[j] = ph
+			sample *= inv_count
 
-	# --- Resonant SVF filter --------------------------------------------
-	if p.filter_type != SynthPatch.FilterType.OFF:
-		var v3: float = sample - v.svf_ic2
-		var v1: float = v.svf_a1 * v.svf_ic1 + v.svf_a2 * v3
-		var v2: float = v.svf_ic2 + v.svf_a2 * v.svf_ic1 + v.svf_a3 * v3
-		v.svf_ic1 = 2.0 * v1 - v.svf_ic1
-		v.svf_ic2 = 2.0 * v2 - v.svf_ic2
-		match p.filter_type:
-			SynthPatch.FilterType.LOWPASS:
-				sample = v2
-			SynthPatch.FilterType.HIGHPASS:
-				sample = sample - v.svf_k * v1 - v2
-			SynthPatch.FilterType.BANDPASS:
-				sample = v1
+		# --- Noise (filtered, with independent decay envelope) ----------
+		if has_noise:
+			var noise: float = randf() * 2.0 - 1.0
+			if p.noise_lowpass < 1.0:
+				v.noise_lp_state += p.noise_lowpass * (noise - v.noise_lp_state)
+				noise = v.noise_lp_state
+			if p.noise_highpass > 0.0:
+				v.noise_hp_state += p.noise_highpass * (noise - v.noise_hp_state)
+				noise -= v.noise_hp_state
+			if p.noise_decay > 0.0 and v.noise_env > 0.0:
+				v.noise_env -= dt / p.noise_decay
+				if v.noise_env < 0.0:
+					v.noise_env = 0.0
+			if noise_full:
+				sample = noise * v.noise_env
+			else:
+				sample = sample * (1.0 - p.noise_mix) + noise * p.noise_mix * v.noise_env
 
-	sample *= v.env_value * v.velocity * p.gain * v.loudness_comp
+		# --- Resonant SVF filter ----------------------------------------
+		if has_filter:
+			var v3: float = sample - v.svf_ic2
+			var v1: float = v.svf_a1 * v.svf_ic1 + v.svf_a2 * v3
+			var v2: float = v.svf_ic2 + v.svf_a2 * v.svf_ic1 + v.svf_a3 * v3
+			v.svf_ic1 = 2.0 * v1 - v.svf_ic1
+			v.svf_ic2 = 2.0 * v2 - v.svf_ic2
+			match filter_type:
+				SynthPatch.FilterType.LOWPASS:
+					sample = v2
+				SynthPatch.FilterType.HIGHPASS:
+					sample = sample - v.svf_k * v1 - v2
+				SynthPatch.FilterType.BANDPASS:
+					sample = v1
 
-	# --- Legacy one-pole lowpass (post-amp) -----------------------------
-	if p.lowpass < 1.0:
-		v.lp_state += p.lowpass * (sample - v.lp_state)
-		sample = v.lp_state
+		sample *= v.env_value * amp_scale
 
-	return sample
+		_mix_l[base + i] += sample * l_gain
+		_mix_r[base + i] += sample * r_gain
