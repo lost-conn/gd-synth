@@ -98,6 +98,27 @@ var _default_patch: SynthPatch
 var _age_counter: int = 0
 var _lfo_time: float = 0.0
 
+# Private RNG so the render thread never touches the global randf() state shared
+# with main-thread game code (pitch/velocity randomize, noise gen all use it).
+var _rng := RandomNumberGenerator.new()
+
+# --- Audio thread + command queue ------------------------------------------
+# Voice/patch state is owned exclusively by the render thread. The public
+# note_on/note_off/bend_to/all_notes_off/set_patch methods run on the main
+# (game) thread and only enqueue commands under a short-held mutex; the thread
+# drains and applies them at the top of each render iteration. Critical
+# sections stay tiny (list append/swap) so the game thread never blocks on a
+# full render block.
+enum { CMD_NOTE_ON, CMD_NOTE_OFF, CMD_BEND, CMD_ALL_OFF, CMD_SET_PATCH }
+var _thread := Thread.new()
+var _running: bool = false
+var _cmd_mutex := Mutex.new()
+var _cmds: Array = []
+# Frames rendered per loop iteration. ~256 @ 22050 Hz ≈ 12 ms, so queued note
+# commands are applied at least this often — bounds scheduling jitter well
+# below buffer_length (0.05 s).
+const _MAX_CHUNK := 256
+
 # Flat mixdown buffers, split L/R: index = channel * frames + sample_index.
 # Two PackedFloat32Arrays instead of one PackedVector2Array so the per-sample
 # accumulate is a plain float += with no Variant/Vector2 boxing. Stored as
@@ -135,6 +156,10 @@ func _ready() -> void:
 	_patches.resize(CHANNEL_COUNT)
 	for i in CHANNEL_COUNT:
 		_patches[i] = _default_patch
+
+	_rng.randomize()
+	_running = true
+	_thread.start(_audio_loop)
 
 ## Route a channel's output to a named audio bus. Users can create buses
 ## in Godot's Audio dock and attach AudioEffect* nodes (reverb, delay,
@@ -207,10 +232,20 @@ func _unique_bus_name(base: StringName) -> StringName:
 	return StringName("%s_%d" % [base, i])
 
 func _exit_tree() -> void:
+	# Stop the render thread before tearing down buses/playbacks it reads.
+	if _running:
+		_running = false
+		if _thread.is_started():
+			_thread.wait_to_finish()
 	for ch in CHANNEL_COUNT:
 		release_channel_bus(ch)
 
 func set_patch(channel: int, patch: SynthPatch) -> void:
+	_cmd_mutex.lock()
+	_cmds.push_back([CMD_SET_PATCH, channel, patch])
+	_cmd_mutex.unlock()
+
+func _apply_set_patch(channel: int, patch: SynthPatch) -> void:
 	if channel < 0 or channel >= 16 or patch == null:
 		return
 	_patches[channel] = patch
@@ -220,6 +255,11 @@ func set_patch(channel: int, patch: SynthPatch) -> void:
 ## The integer part (rounded) is used as the lookup key for [method note_off]
 ## and [method bend_to]; the fractional part feeds frequency.
 func note_on(channel: int, note: float, velocity: float = 1.0, pan: float = 0.0) -> void:
+	_cmd_mutex.lock()
+	_cmds.push_back([CMD_NOTE_ON, channel, note, velocity, pan])
+	_cmd_mutex.unlock()
+
+func _apply_note_on(channel: int, note: float, velocity: float, pan: float) -> void:
 	var v := _allocate_voice()
 	var patch: SynthPatch = _patches[channel]
 	_age_counter += 1
@@ -229,7 +269,7 @@ func note_on(channel: int, note: float, velocity: float = 1.0, pan: float = 0.0)
 	v.note = roundi(note)
 	var effective_freq: float = 440.0 * pow(2.0, (note - 69.0) / 12.0)
 	if patch.pitch_randomize_cents > 0.0:
-		var cents: float = (randf() * 2.0 - 1.0) * patch.pitch_randomize_cents
+		var cents: float = (_rng.randf() * 2.0 - 1.0) * patch.pitch_randomize_cents
 		effective_freq *= pow(2.0, cents / 1200.0)
 	v.freq = effective_freq
 	v.glide_samples_left = 0
@@ -237,7 +277,7 @@ func note_on(channel: int, note: float, velocity: float = 1.0, pan: float = 0.0)
 	v.glide_target_freq = effective_freq
 	var eff_vel: float = clamp(velocity, 0.0, 1.0)
 	if patch.velocity_randomize > 0.0:
-		eff_vel *= lerpf(1.0 - patch.velocity_randomize, 1.0, randf())
+		eff_vel *= lerpf(1.0 - patch.velocity_randomize, 1.0, _rng.randf())
 	v.velocity = eff_vel
 	v.pan = clampf(pan, -1.0, 1.0)
 	v.patch = patch
@@ -264,9 +304,14 @@ func note_on(channel: int, note: float, velocity: float = 1.0, pan: float = 0.0)
 		v.detune_phase = PackedFloat32Array()
 		v.detune_phase.resize(dv)
 		for i in dv:
-			v.detune_phase[i] = randf()
+			v.detune_phase[i] = _rng.randf()
 
 func note_off(channel: int, note: int) -> void:
+	_cmd_mutex.lock()
+	_cmds.push_back([CMD_NOTE_OFF, channel, note])
+	_cmd_mutex.unlock()
+
+func _apply_note_off(channel: int, note: int) -> void:
 	for v in _voices:
 		if v.active and not v.released and v.channel == channel and v.note == note:
 			v.released = true
@@ -285,6 +330,11 @@ func note_off(channel: int, note: int) -> void:
 ## glide_seconds <= 0 snaps immediately. Stacks: calling bend_to again
 ## mid-glide picks up from the current (mid-glide) pitch.
 func bend_to(channel: int, source_midi: int, target_freq: float, glide_seconds: float) -> void:
+	_cmd_mutex.lock()
+	_cmds.push_back([CMD_BEND, channel, source_midi, target_freq, glide_seconds])
+	_cmd_mutex.unlock()
+
+func _apply_bend_to(channel: int, source_midi: int, target_freq: float, glide_seconds: float) -> void:
 	var voice: Voice = null
 	var newest_age: int = -1
 	for v in _voices:
@@ -308,6 +358,11 @@ func bend_to(channel: int, source_midi: int, target_freq: float, glide_seconds: 
 	voice.glide_factor = pow(ratio, 1.0 / float(samples))
 
 func all_notes_off() -> void:
+	_cmd_mutex.lock()
+	_cmds.push_back([CMD_ALL_OFF])
+	_cmd_mutex.unlock()
+
+func _apply_all_notes_off() -> void:
 	for v in _voices:
 		v.active = false
 		v.released = false
@@ -323,14 +378,49 @@ func _allocate_voice() -> Voice:
 			oldest = v
 	return oldest
 
-func _process(_delta: float) -> void:
+# Render thread entry point. Owns all voice/patch state: drains queued commands,
+# fills whatever the generator can take (capped per iteration), then sleeps when
+# the buffer is full to avoid busy-spinning.
+func _audio_loop() -> void:
+	while _running:
+		_drain_commands()
+		var filled := _render_block(_MAX_CHUNK)
+		if filled <= 0:
+			OS.delay_usec(2000)
+
+# Pop all queued commands under the mutex (cheap swap), then apply them in FIFO
+# order on this (render) thread so voice/patch mutation never races the game thread.
+func _drain_commands() -> void:
+	_cmd_mutex.lock()
+	var batch := _cmds
+	_cmds = []
+	_cmd_mutex.unlock()
+	for c in batch:
+		match c[0]:
+			CMD_NOTE_ON:
+				_apply_note_on(c[1], c[2], c[3], c[4])
+			CMD_NOTE_OFF:
+				_apply_note_off(c[1], c[2])
+			CMD_BEND:
+				_apply_bend_to(c[1], c[2], c[3], c[4])
+			CMD_ALL_OFF:
+				_apply_all_notes_off()
+			CMD_SET_PATCH:
+				_apply_set_patch(c[1], c[2])
+
+# Render up to [param max_frames] of audio across all channels and push to the
+# generators. Returns the number of frames actually filled (0 if the buffer is
+# already full). Runs only on the audio thread.
+func _render_block(max_frames: int) -> int:
 	if _channel_playbacks.is_empty() or _channel_playbacks[0] == null:
-		return
+		return 0
 	# Use channel 0's playback to determine how many frames to fill; all
 	# channels share the same mix_rate + buffer_length so they stay in sync.
-	var frames := _channel_playbacks[0].get_frames_available()
+	var frames: int = _channel_playbacks[0].get_frames_available()
 	if frames <= 0:
-		return
+		return 0
+	if frames > max_frames:
+		frames = max_frames
 	var dt := 1.0 / mix_rate
 
 	# Resize + zero the flat L/R mixdown buffers.
@@ -370,6 +460,7 @@ func _process(_delta: float) -> void:
 			elif rx < -1.0: rx = -1.0
 			_push_buf[i] = Vector2(lx, rx)
 		playback.push_buffer(_push_buf)
+	return frames
 
 func _update_svf_coefs(v: Voice, p: SynthPatch) -> void:
 	# Effective cutoff: base + envelope modulation, clamped to 0..1.
@@ -536,7 +627,7 @@ func _render_voice_block(v: Voice, frames: int, dt: float, lfo_base: float) -> v
 
 		# --- Noise (filtered, with independent decay envelope) ----------
 		if has_noise:
-			var noise: float = randf() * 2.0 - 1.0
+			var noise: float = _rng.randf() * 2.0 - 1.0
 			if p.noise_lowpass < 1.0:
 				v.noise_lp_state += p.noise_lowpass * (noise - v.noise_lp_state)
 				noise = v.noise_lp_state
