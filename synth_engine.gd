@@ -10,8 +10,9 @@ extends Node
 # (see SynthPatch) so there are no per-sample sin() calls in the hot path.
 
 ## Audio sample rate (Hz). 22050 is plenty for game music and costs half the
-## CPU of 44100. Higher rates reduce aliasing on bright/saw timbres.
-## Cannot be changed after [method _ready].
+## CPU of 44100. Higher rates reduce aliasing on bright/saw timbres. Set the
+## initial value here; change it at runtime via [method configure] (which
+## rebuilds the players, since a live AudioStreamGenerator can't be re-rated).
 @export var mix_rate: float = 22050.0
 
 ## AudioStreamGenerator buffer length in seconds. Shorter = lower latency but
@@ -127,6 +128,10 @@ const _MAX_CHUNK := 256
 var _mix_l: PackedFloat32Array = PackedFloat32Array()
 var _mix_r: PackedFloat32Array = PackedFloat32Array()
 var _push_buf: PackedVector2Array = PackedVector2Array()
+# Scratch for per-buffer unison detune ratios (constant within a buffer). Reused
+# across voices on the render thread to avoid per-buffer allocation (GC churn in
+# the audio loop risks underruns).
+var _detune_ratios: PackedFloat32Array = PackedFloat32Array()
 
 const CHANNEL_COUNT := 16
 
@@ -135,22 +140,14 @@ func _ready() -> void:
 	_channel_playbacks.resize(CHANNEL_COUNT)
 	_channel_buses.resize(CHANNEL_COUNT)
 	for ch in CHANNEL_COUNT:
-		var stream := AudioStreamGenerator.new()
-		stream.mix_rate = mix_rate
-		stream.buffer_length = buffer_length
-		var player := AudioStreamPlayer.new()
-		player.name = "Ch%dPlayer" % ch
-		player.stream = stream
-		player.bus = &"Master"
-		add_child(player)
-		player.play()
-		_channel_players[ch] = player
-		_channel_playbacks[ch] = player.get_stream_playback()
 		_channel_buses[ch] = &""
 
-	_voices.resize(max_voices)
-	for i in max_voices:
-		_voices[i] = Voice.new()
+	# First build: all channels route straight to Master.
+	var routes: Array = []
+	routes.resize(CHANNEL_COUNT)
+	routes.fill(&"Master")
+	_create_channel_players(routes)
+	_create_voice_pool()
 
 	_default_patch = SynthPatch.new()
 	_patches.resize(CHANNEL_COUNT)
@@ -158,8 +155,71 @@ func _ready() -> void:
 		_patches[i] = _default_patch
 
 	_rng.randomize()
+	_start_thread()
+
+# Build the 16 per-channel AudioStreamPlayers at the current mix_rate /
+# buffer_length, routing each to bus_routes[ch]. Populates _channel_players and
+# _channel_playbacks. Render thread must be stopped when this runs.
+func _create_channel_players(bus_routes: Array) -> void:
+	for ch in CHANNEL_COUNT:
+		var stream := AudioStreamGenerator.new()
+		stream.mix_rate = mix_rate
+		stream.buffer_length = buffer_length
+		var player := AudioStreamPlayer.new()
+		player.name = "Ch%dPlayer" % ch
+		player.stream = stream
+		player.bus = bus_routes[ch]
+		add_child(player)
+		player.play()
+		_channel_players[ch] = player
+		_channel_playbacks[ch] = player.get_stream_playback()
+
+func _create_voice_pool() -> void:
+	_voices.clear()
+	_voices.resize(max_voices)
+	for i in max_voices:
+		_voices[i] = Voice.new()
+
+func _start_thread() -> void:
 	_running = true
+	_thread = Thread.new()
 	_thread.start(_audio_loop)
+
+func _stop_thread() -> void:
+	if _running:
+		_running = false
+		if _thread.is_started():
+			_thread.wait_to_finish()
+
+## Rebuild the audio pipeline with new quality settings. Safe to call at runtime
+## (e.g. when the game switches graphics/quality tiers): the render thread is
+## stopped during the rebuild. A live AudioStreamGenerator's mix_rate can't be
+## changed, so the per-channel players are recreated; bus routing and per-channel
+## patches are preserved, but any currently-sounding notes are dropped.
+func configure(p_mix_rate: float, p_buffer_length: float, p_max_voices: int) -> void:
+	if is_equal_approx(p_mix_rate, mix_rate) and is_equal_approx(p_buffer_length, buffer_length) \
+			and p_max_voices == max_voices:
+		return
+	_stop_thread()
+	# Snapshot current bus routing so rebuilt players keep their effect chains.
+	var routes: Array = []
+	routes.resize(CHANNEL_COUNT)
+	for ch in CHANNEL_COUNT:
+		var p: AudioStreamPlayer = _channel_players[ch]
+		routes[ch] = p.bus if p != null else &"Master"
+		if p != null:
+			remove_child(p)
+			p.free()
+	mix_rate = p_mix_rate
+	buffer_length = p_buffer_length
+	max_voices = maxi(1, p_max_voices)
+	_create_channel_players(routes)
+	_create_voice_pool()
+	# Frame count per buffer changed; force the mix/push buffers to re-alloc.
+	_mix_l = PackedFloat32Array()
+	_mix_r = PackedFloat32Array()
+	_push_buf = PackedVector2Array()
+	_start_thread()
 
 ## Route a channel's output to a named audio bus. Users can create buses
 ## in Godot's Audio dock and attach AudioEffect* nodes (reverb, delay,
@@ -233,10 +293,7 @@ func _unique_bus_name(base: StringName) -> StringName:
 
 func _exit_tree() -> void:
 	# Stop the render thread before tearing down buses/playbacks it reads.
-	if _running:
-		_running = false
-		if _thread.is_started():
-			_thread.wait_to_finish()
+	_stop_thread()
 	for ch in CHANNEL_COUNT:
 		release_channel_bus(ch)
 
@@ -501,6 +558,16 @@ func _render_voice_block(v: Voice, frames: int, dt: float, lfo_base: float) -> v
 	var noise_full: bool = p.noise_mix >= 1.0
 	var dv: int = p.detune_voices
 	var inv_count: float = 1.0 / float(dv) if dv > 1 else 1.0
+	# Unison detune ratios are constant across the buffer (depend only on dv and
+	# detune_cents), so compute the pow() once here instead of per sample per
+	# unison voice — a real saving on fat/detuned patches.
+	if dv > 1:
+		if _detune_ratios.size() != dv:
+			_detune_ratios.resize(dv)
+		for j in dv:
+			var jt: float = float(j) / float(dv - 1)
+			var jcents: float = lerpf(-p.detune_cents, p.detune_cents, jt)
+			_detune_ratios[j] = pow(2.0, jcents / 1200.0)
 
 	# SVF coefficients: once per buffer (uses fenv_value carried from the prior
 	# buffer's end), matching the original cadence — the filter cutoff envelope
@@ -613,11 +680,7 @@ func _render_voice_block(v: Voice, frames: int, dt: float, lfo_base: float) -> v
 				v.phase -= floor(v.phase)
 		else:
 			for j in dv:
-				var t: float = 0.5
-				if dv > 1:
-					t = float(j) / float(dv - 1)
-				var cents: float = lerpf(-p.detune_cents, p.detune_cents, t)
-				var f: float = freq * pow(2.0, cents / 1200.0)
+				var f: float = freq * _detune_ratios[j]
 				sample += p.sample(fposmod(v.detune_phase[j] + fm_offset, 1.0))
 				var ph: float = v.detune_phase[j] + f * dt
 				if ph >= 1.0:
