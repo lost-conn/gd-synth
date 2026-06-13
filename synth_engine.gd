@@ -113,6 +113,10 @@ var _rng := RandomNumberGenerator.new()
 enum { CMD_NOTE_ON, CMD_NOTE_OFF, CMD_BEND, CMD_ALL_OFF, CMD_SET_PATCH }
 var _thread := Thread.new()
 var _running: bool = false
+# When false, the render thread is stopped (zero synth CPU) and incoming note
+# commands are dropped. Toggled via set_enabled() — lets a host kill the engine
+# entirely (e.g. a "disable synth" setting on weak hardware).
+var _enabled: bool = true
 var _cmd_mutex := Mutex.new()
 var _cmds: Array = []
 # Frames rendered per loop iteration. ~256 @ 22050 Hz ≈ 12 ms, so queued note
@@ -219,7 +223,30 @@ func configure(p_mix_rate: float, p_buffer_length: float, p_max_voices: int) -> 
 	_mix_l = PackedFloat32Array()
 	_mix_r = PackedFloat32Array()
 	_push_buf = PackedVector2Array()
-	_start_thread()
+	# Stay silent if disabled — don't resurrect the render thread.
+	if _enabled:
+		_start_thread()
+
+## Enable or disable the whole engine. Disabling stops the render thread (so the
+## synth costs zero CPU) and drops queued/incoming notes; enabling restarts it.
+## Useful as a user setting to bail out of audio on hardware that can't keep up.
+func set_enabled(p_enabled: bool) -> void:
+	if p_enabled == _enabled:
+		return
+	_enabled = p_enabled
+	if _enabled:
+		_start_thread()
+	else:
+		_stop_thread()
+		# Drop pending commands and silence held voices so a later enable is clean.
+		_cmd_mutex.lock()
+		_cmds.clear()
+		_cmd_mutex.unlock()
+		for v in _voices:
+			v.active = false
+
+func is_enabled() -> bool:
+	return _enabled
 
 ## Route a channel's output to a named audio bus. Users can create buses
 ## in Godot's Audio dock and attach AudioEffect* nodes (reverb, delay,
@@ -298,6 +325,8 @@ func _exit_tree() -> void:
 		release_channel_bus(ch)
 
 func set_patch(channel: int, patch: SynthPatch) -> void:
+	if not _enabled:
+		return
 	_cmd_mutex.lock()
 	_cmds.push_back([CMD_SET_PATCH, channel, patch])
 	_cmd_mutex.unlock()
@@ -312,6 +341,8 @@ func _apply_set_patch(channel: int, patch: SynthPatch) -> void:
 ## The integer part (rounded) is used as the lookup key for [method note_off]
 ## and [method bend_to]; the fractional part feeds frequency.
 func note_on(channel: int, note: float, velocity: float = 1.0, pan: float = 0.0) -> void:
+	if not _enabled:
+		return
 	_cmd_mutex.lock()
 	_cmds.push_back([CMD_NOTE_ON, channel, note, velocity, pan])
 	_cmd_mutex.unlock()
@@ -364,6 +395,8 @@ func _apply_note_on(channel: int, note: float, velocity: float, pan: float) -> v
 			v.detune_phase[i] = _rng.randf()
 
 func note_off(channel: int, note: int) -> void:
+	if not _enabled:
+		return
 	_cmd_mutex.lock()
 	_cmds.push_back([CMD_NOTE_OFF, channel, note])
 	_cmd_mutex.unlock()
@@ -387,6 +420,8 @@ func _apply_note_off(channel: int, note: int) -> void:
 ## glide_seconds <= 0 snaps immediately. Stacks: calling bend_to again
 ## mid-glide picks up from the current (mid-glide) pitch.
 func bend_to(channel: int, source_midi: int, target_freq: float, glide_seconds: float) -> void:
+	if not _enabled:
+		return
 	_cmd_mutex.lock()
 	_cmds.push_back([CMD_BEND, channel, source_midi, target_freq, glide_seconds])
 	_cmd_mutex.unlock()
@@ -415,6 +450,8 @@ func _apply_bend_to(channel: int, source_midi: int, target_freq: float, glide_se
 	voice.glide_factor = pow(ratio, 1.0 / float(samples))
 
 func all_notes_off() -> void:
+	if not _enabled:
+		return
 	_cmd_mutex.lock()
 	_cmds.push_back([CMD_ALL_OFF])
 	_cmd_mutex.unlock()
