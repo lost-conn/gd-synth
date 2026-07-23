@@ -762,3 +762,194 @@ func _render_voice_block(v: Voice, frames: int, dt: float, lfo_base: float) -> v
 
 		_mix_l[base + i] += sample * l_gain
 		_mix_r[base + i] += sample * r_gain
+
+# ---------------------------------------------------------------------------
+# Offline rendering (baking)
+# ---------------------------------------------------------------------------
+# Render a note timeline to a PCM buffer synchronously — no audio thread, no
+# AudioStreamGenerator. The exact per-voice DSP used by live playback
+# (_render_voice_block) drives an in-memory mixdown instead of the sound card,
+# so a bake is sample-identical to what the engine would have played live.
+#
+# This is the shared foundation for both bake modes:
+#   • whole-track bake — flatten a MusicData progression to events, render the
+#                        full loop to one looping AudioStreamWAV, play it back
+#                        for ~zero CPU on low-end hardware.
+#   • per-patch sample — render a single note (or short pattern) per patch to
+#                        an AudioStreamWAV that a sampler backend resamples.
+#
+# Call on a throwaway instance that is NOT added to the scene tree, so _ready()
+# never starts the render thread or the channel players:
+#   var baker := SynthEngine.new()
+#   var wav := baker.render_note_offline(patch, 60.0, 1.0)
+#
+# Rendering is deterministic: the RNG is reseeded from p_seed so noise and
+# humanization reproduce identically across bakes.
+#
+# Event shape mirrors the live command queue with a leading timestamp (seconds):
+#   [time, CMD_NOTE_ON,   channel, note, velocity, pan]
+#   [time, CMD_NOTE_OFF,  channel, note]
+#   [time, CMD_BEND,      channel, source_midi, target_freq, glide_seconds]
+#   [time, CMD_SET_PATCH, channel, patch]
+#   [time, CMD_ALL_OFF]
+
+## Render [param events] (see shape above) against [param patches] (a
+## per-channel Array[SynthPatch]; gaps fall back to a default patch) to a stereo
+## [AudioStreamWAV] of [param total_seconds]. Set [param loop] for a plain
+## start-to-end loop (no tail wrap — use [method render_loop_offline] for
+## seamless musical loops). Safe to call on an out-of-tree instance.
+func render_offline(events: Array, patches: Array, total_seconds: float,
+		p_mix_rate: float = 22050.0, loop: bool = false, p_seed: int = 1234) -> AudioStreamWAV:
+	var frames: int = int(ceil(total_seconds * p_mix_rate))
+	var buf: Array = _render_events(events, patches, frames, p_mix_rate, p_seed)
+	return _make_wav(buf[0], buf[1], int(p_mix_rate), loop)
+
+## Render a seamless looping bake of [param loop_seconds]. Renders an extra
+## [param wrap_seconds] past the loop point and folds that overflow back onto
+## the start, so note tails / releases that cross the boundary wrap correctly
+## instead of clicking. Returns a looping [AudioStreamWAV] exactly loop-length.
+func render_loop_offline(events: Array, patches: Array, loop_seconds: float,
+		wrap_seconds: float = 1.0, p_mix_rate: float = 22050.0, p_seed: int = 1234) -> AudioStreamWAV:
+	var loop_frames: int = int(round(loop_seconds * p_mix_rate))
+	var wrap_frames: int = int(round(wrap_seconds * p_mix_rate))
+	if loop_frames <= 0:
+		return _make_wav(PackedFloat32Array(), PackedFloat32Array(), int(p_mix_rate), true)
+	var buf: Array = _render_events(events, patches, loop_frames + wrap_frames, p_mix_rate, p_seed)
+	var l: PackedFloat32Array = buf[0]
+	var r: PackedFloat32Array = buf[1]
+	# Fold the overflow tail back onto the loop start (overlap-add).
+	var end: int = mini(l.size(), loop_frames + wrap_frames)
+	for i in range(loop_frames, end):
+		var j: int = i - loop_frames
+		l[j] += l[i]
+		r[j] += r[i]
+	l.resize(loop_frames)
+	r.resize(loop_frames)
+	return _make_wav(l, r, int(p_mix_rate), true)
+
+# Core offline mixdown: render [param total_frames] of [param events] through
+# [param patches] and return [out_l, out_r] float buffers. Reuses the live
+# per-voice DSP (_render_voice_block) so output matches real playback. Runs
+# synchronously; safe on an out-of-tree instance.
+func _render_events(events: Array, patches: Array, total_frames: int,
+		p_mix_rate: float, p_seed: int) -> Array:
+	mix_rate = p_mix_rate
+	_rng = RandomNumberGenerator.new()
+	_rng.seed = p_seed
+	_lfo_time = 0.0
+	_age_counter = 0
+	_detune_ratios = PackedFloat32Array()
+	_create_voice_pool()
+
+	if _default_patch == null:
+		_default_patch = SynthPatch.new()
+	_patches.resize(CHANNEL_COUNT)
+	for ch in CHANNEL_COUNT:
+		var p: SynthPatch = patches[ch] if ch < patches.size() and patches[ch] != null else _default_patch
+		_patches[ch] = p
+
+	# Stable time sort (index tiebreaker) so simultaneous events keep order.
+	var evs: Array = events.duplicate()
+	evs.sort_custom(func(a, b): return float(a[0]) < float(b[0]))
+
+	var out_l := PackedFloat32Array()
+	var out_r := PackedFloat32Array()
+	if total_frames <= 0:
+		return [out_l, out_r]
+	out_l.resize(total_frames)
+	out_r.resize(total_frames)
+
+	var dt: float = 1.0 / mix_rate
+	var ev_i: int = 0
+	var frame: int = 0
+	while frame < total_frames:
+		var frames: int = mini(_MAX_CHUNK, total_frames - frame)
+		# Apply every event scheduled to start before this block's end, matching
+		# the live engine's per-iteration command-drain cadence.
+		var block_end_time: float = float(frame + frames) * dt
+		while ev_i < evs.size() and float(evs[ev_i][0]) < block_end_time:
+			_apply_event(evs[ev_i])
+			ev_i += 1
+
+		var total: int = CHANNEL_COUNT * frames
+		if _mix_l.size() != total:
+			_mix_l.resize(total)
+			_mix_r.resize(total)
+		_mix_l.fill(0.0)
+		_mix_r.fill(0.0)
+
+		var lfo_base: float = _lfo_time
+		for v in _voices:
+			if v.active:
+				_render_voice_block(v, frames, dt, lfo_base)
+		_lfo_time = lfo_base + frames * dt
+
+		# Sum all channels into the stereo output, apply master gain + clip.
+		for i in frames:
+			var lx: float = 0.0
+			var rx: float = 0.0
+			for ch in CHANNEL_COUNT:
+				var b: int = ch * frames + i
+				lx += _mix_l[b]
+				rx += _mix_r[b]
+			lx *= master_gain
+			rx *= master_gain
+			if lx > 1.0: lx = 1.0
+			elif lx < -1.0: lx = -1.0
+			if rx > 1.0: rx = 1.0
+			elif rx < -1.0: rx = -1.0
+			out_l[frame + i] = lx
+			out_r[frame + i] = rx
+
+		frame += frames
+
+	return [out_l, out_r]
+
+## Convenience: bake a single note of [param patch] — [param hold_seconds] held
+## then released, plus [param tail_seconds] for the release/decay to ring out.
+## Returns a one-shot (non-looping) [AudioStreamWAV]. The per-patch sample-bake
+## primitive.
+func render_note_offline(patch: SynthPatch, midi: float, hold_seconds: float,
+		velocity: float = 0.8, tail_seconds: float = 0.5,
+		p_mix_rate: float = 22050.0, p_seed: int = 1234) -> AudioStreamWAV:
+	var events: Array = [
+		[0.0, CMD_NOTE_ON, 0, midi, velocity, 0.0],
+		[hold_seconds, CMD_NOTE_OFF, 0, roundi(midi)],
+	]
+	return render_offline(events, [patch], hold_seconds + tail_seconds, p_mix_rate, false, p_seed)
+
+# Dispatch one timeline event through the same apply-handlers the render thread
+# uses, so offline scheduling can never drift from live behavior.
+func _apply_event(e: Array) -> void:
+	match e[1]:
+		CMD_NOTE_ON:
+			_apply_note_on(e[2], e[3], e[4], e[5])
+		CMD_NOTE_OFF:
+			_apply_note_off(e[2], e[3])
+		CMD_BEND:
+			_apply_bend_to(e[2], e[3], e[4], e[5])
+		CMD_ALL_OFF:
+			_apply_all_notes_off()
+		CMD_SET_PATCH:
+			_apply_set_patch(e[2], e[3])
+
+# Pack float L/R buffers into a 16-bit stereo AudioStreamWAV.
+func _make_wav(l: PackedFloat32Array, r: PackedFloat32Array, rate: int, loop: bool) -> AudioStreamWAV:
+	var n: int = l.size()
+	var bytes := PackedByteArray()
+	bytes.resize(n * 4)  # 2 channels * 2 bytes/sample
+	var bi: int = 0
+	for i in n:
+		bytes.encode_s16(bi, int(clampf(l[i], -1.0, 1.0) * 32767.0))
+		bytes.encode_s16(bi + 2, int(clampf(r[i], -1.0, 1.0) * 32767.0))
+		bi += 4
+	var wav := AudioStreamWAV.new()
+	wav.format = AudioStreamWAV.FORMAT_16_BITS
+	wav.stereo = true
+	wav.mix_rate = rate
+	wav.data = bytes
+	if loop and n > 0:
+		wav.loop_mode = AudioStreamWAV.LOOP_FORWARD
+		wav.loop_begin = 0
+		wav.loop_end = n
+	return wav
