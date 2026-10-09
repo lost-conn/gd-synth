@@ -38,10 +38,18 @@ extends Resource
 #   • needs_release(i, elapsed, pitch_scale) false: do nothing. The sample was
 #     recorded with its own note-off (gates[i]) and its release is already in the
 #     audio, or it has simply finished.
-#   • true: ramp the voice's volume linearly IN AMPLITUDE (not in dB) to zero over
-#     `release` seconds, then stop it. That is the engine's release exactly when
-#     the note has reached its sustain; a note released mid-decay comes out a
-#     little shorter than live, because the sample keeps decaying under the ramp.
+#   • true: for the next `release` seconds scale the voice's volume by
+#     get_release_gain(), then stop it. For a note that has reached its sustain
+#     that is a straight line IN AMPLITUDE (not in dB) from 1 to 0 — the engine's
+#     release. Two things bend it, and get_release_gain() does both:
+#       - a note released mid-attack or mid-decay. The sample keeps decaying
+#         under the ramp where the live voice stops decaying and only releases,
+#         so the gain makes up the difference (it goes above 1, up to
+#         RELEASE_BOOST), from the envelope times kept below.
+#       - a sample that clipped. Live the release happens before the channel
+#         clip, so the level hangs on and then drops; the gain follows the
+#         sample's velocity curve to give that level. (The level, not the
+#         waveform: the sample stays as clipped as it was struck.)
 #     The filter envelope's own release is not reproduced.
 #   The engine releases the oldest unreleased voice of that (channel, rounded
 #   note); all_notes_off() cuts every voice dead with no release at all.
@@ -120,7 +128,7 @@ extends Resource
 # --- What the sampler cannot recover from the audio ---------------------------
 
 ## Amp envelope of the source patch, seconds / level. [member release] is the
-## length of the note-off ramp; the rest is for a sampler that wants to know
+## length of the note-off ramp; the rest is how [method get_release_gain] knows
 ## where in the envelope a voice is.
 @export var attack: float = 0.0
 @export var decay: float = 0.0
@@ -256,17 +264,65 @@ func get_pitch_scale(i: int, note: float) -> float:
 ## (through the clip, if the sample clipped) and corrects the equal-loudness gain
 ## when [param note] is not the sample's root.
 func get_volume(i: int, note: float, velocity: float) -> float:
-	var level: float
-	var curve: PackedFloat32Array = velocity_curves[i] if i < velocity_curves.size() else PackedFloat32Array()
+	var comp: float = _loudness(note) / _loudness(root_pitches[i])
+	return _velocity_level(i, velocity) * comp / maxf(gains[i], 1e-9)
+
+## Most [method get_release_gain] will turn a voice up to make a decaying sample
+## follow the engine's release.
+const RELEASE_BOOST := 4.0
+
+## Factor on a voice's note-on volume while it is being released: the voice was
+## struck at [param velocity], got its note_off [param held] seconds later, that
+## was [param since] seconds ago, and it is now [param position] seconds into
+## sample [param i] ([param position] is not [code]held + since[/code] when the
+## sample is played off its root or has been bent). 0 once the release is over.
+## Only for a voice that [method needs_release].
+func get_release_gain(i: int, velocity: float, held: float, since: float, position: float) -> float:
+	if release <= 0.0 or since >= release:
+		return 0.0
+	# Where the engine's envelope would be, over where the sample's is.
+	var want: float = _held_envelope(held) * (1.0 - maxf(since, 0.0) / release)
+	var have: float = get_envelope(i, position)
+	if have <= 0.0001:
+		return 0.0  # nothing left in the sample to turn up
+	var ratio: float = minf(want / have, RELEASE_BOOST)
+	# Through the clip that is the level of a note struck `ratio` times as hard.
+	if i < velocity_curves.size() and velocity_curves[i].size() >= 2:
+		var vel: float = clampf(velocity, 0.0, 1.0)
+		var level: float = _velocity_level(i, vel)
+		if level > 0.0:
+			return _velocity_level(i, vel * ratio) / level
+	return ratio
+
+## Level (0..1) of the amp envelope baked into sample [param i],
+## [param position] seconds into it: attack, decay and sustain, then the
+## sample's own release if it was recorded with a note-off.
+func get_envelope(i: int, position: float) -> float:
+	var gate: float = gates[i]
+	if gate < 0.0 or position <= gate:
+		return _held_envelope(position)
+	if release <= 0.0:
+		return 0.0
+	return _held_envelope(gate) * maxf(1.0 - (position - gate) / release, 0.0)
+
+# The engine's amp envelope t seconds into a note that is still held.
+func _held_envelope(t: float) -> float:
+	if attack > 0.0 and t < attack:
+		return maxf(t, 0.0) / attack
+	if decay > 0.0 and t < attack + decay:
+		return lerpf(1.0, sustain, (t - attack) / decay)
+	return sustain
+
+# Level of sample i at a velocity, relative to the stored sample: proportional
+# to velocity, unless the sample clipped — then its velocity curve.
+func _velocity_level(i: int, velocity: float) -> float:
 	var vel: float = clampf(velocity, 0.0, 1.0)
+	var curve: PackedFloat32Array = velocity_curves[i] if i < velocity_curves.size() else PackedFloat32Array()
 	if curve.size() >= 2:
 		var x: float = vel * float(curve.size() - 1)
 		var k: int = mini(int(x), curve.size() - 2)
-		level = lerpf(curve[k], curve[k + 1], x - float(k))
-	else:
-		level = vel / maxf(velocities[i], 1e-6)
-	var comp: float = _loudness(note) / _loudness(root_pitches[i])
-	return level * comp / maxf(gains[i], 1e-9)
+		return lerpf(curve[k], curve[k + 1], x - float(k))
+	return vel / maxf(velocities[i], 1e-6)
 
 ## Whether a note_off arriving [param elapsed] seconds after its note_on has to
 ## be turned into a release ramp. False once a gated sample has passed its own
