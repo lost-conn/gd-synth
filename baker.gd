@@ -13,12 +13,26 @@ extends RefCounted
 # server DSP applied downstream and aren't available offline. Route the baked
 # player through the same bus at playback if you need bus-level effects.
 #
+# Bakes default to DEFAULT_MIX_RATE and to SynthEngine.OfflineGain.LIMIT_PEAK —
+# the mix is never hard-clipped; a bake that would exceed the ceiling is scaled
+# down instead, and last_stats says by how much. Pass OfflineGain.CLIP (and
+# 22050.0) to reproduce a bake from before gain staging existed.
+#
 # Typical use (editor or headless):
 #   var song := SynthBaker.collect_song(main_music_node)   # {data, tracks, swing}
 #   var wav := SynthBaker.bake_song(song.data, song.tracks, song.swing)
 #   ResourceSaver.save(wav, "res://resources/audio/baked/bgm/main.wav")
 
 const _TICKS := 480  # subdivisions per beat for exact loop-length LCM
+
+## Bake sample rate (Hz) unless a caller asks otherwise. Independent of the live
+## engine's mix_rate: a bake costs nothing to play back, so it can afford the
+## rate at which bright / FM patches stop aliasing audibly.
+const DEFAULT_MIX_RATE := 44100.0
+
+## [member SynthEngine.last_offline_stats] of the most recent bake (pre-clip
+## peak, clipped-sample count, gain applied). Empty if the bake produced nothing.
+static var last_stats: Dictionary = {}
 
 ## One track's contribution. `track_type` uses MusicTrack.TrackType values.
 ## Build these by hand or via [method collect_song].
@@ -65,9 +79,11 @@ static func collect_song(root: Node, swing: float = 0.0) -> Dictionary:
 # ---------------------------------------------------------------------------
 
 ## Flatten + render a whole song to a seamless looping AudioStreamWAV.
+## [param gain_mode] is a [enum SynthEngine.OfflineGain].
 static func bake_song(data: MusicData, tracks: Array, swing: float = 0.0,
-		mix_rate: float = 22050.0, wrap_seconds: float = 1.0,
-		seed: int = 1234) -> AudioStreamWAV:
+		mix_rate: float = DEFAULT_MIX_RATE, wrap_seconds: float = 1.0,
+		seed: int = 1234, gain_mode: int = SynthEngine.OfflineGain.LIMIT_PEAK) -> AudioStreamWAV:
+	last_stats = {}
 	if data == null or data.blocks.is_empty():
 		push_warning("[SynthBaker] No MusicData / empty progression.")
 		return null
@@ -88,7 +104,9 @@ static func bake_song(data: MusicData, tracks: Array, swing: float = 0.0,
 		_flatten_track(events, info, data, loop_beats, swing, spb, bpm)
 
 	var synth := SynthEngine.new()
+	synth.offline_gain_mode = gain_mode
 	var wav := synth.render_loop_offline(events, patches, loop_seconds, wrap_seconds, mix_rate, seed)
+	last_stats = synth.last_offline_stats
 	synth.free()
 	return wav
 
@@ -97,10 +115,13 @@ static func bake_song(data: MusicData, tracks: Array, swing: float = 0.0,
 ## fixed block, e.g. the song's tonic, since a baked SFX can't track live
 ## harmony); DRUM ignores it. One-shots run until the last note-off plus an
 ## envelope tail; set [param loop] for sustained SFX (rendered over one pattern
-## length with a seamless wrap).
+## length with a seamless wrap). [param gain_mode] is a
+## [enum SynthEngine.OfflineGain].
 static func bake_pattern(pattern: MusicPattern, patch: SynthPatch, track_type: int,
-		base_octave: int, block: MusicBlock, bpm: float, mix_rate: float = 22050.0,
-		loop: bool = false, seed: int = 1234) -> AudioStreamWAV:
+		base_octave: int, block: MusicBlock, bpm: float, mix_rate: float = DEFAULT_MIX_RATE,
+		loop: bool = false, seed: int = 1234,
+		gain_mode: int = SynthEngine.OfflineGain.LIMIT_PEAK) -> AudioStreamWAV:
+	last_stats = {}
 	if pattern == null or pattern.notes.is_empty() or pattern.length_beats <= 0.0:
 		return null
 	var spb: float = 60.0 / maxf(bpm, 1.0)
@@ -122,6 +143,7 @@ static func bake_pattern(pattern: MusicPattern, patch: SynthPatch, track_type: i
 			_flatten_bends(events, info, block, handle, note.bends, note.beat, 0.0, spb)
 
 	var synth := SynthEngine.new()
+	synth.offline_gain_mode = gain_mode
 	var wav: AudioStreamWAV
 	if loop:
 		wav = synth.render_loop_offline(events, [patch], pattern.length_beats * spb, 1.0, mix_rate, seed)
@@ -130,6 +152,7 @@ static func bake_pattern(pattern: MusicPattern, patch: SynthPatch, track_type: i
 		# so release dominates; noise_decay covers cymbal-like tails).
 		var tail: float = clampf(patch.release + maxf(patch.decay, patch.noise_decay) + 0.15, 0.2, 3.0)
 		wav = synth.render_offline(events, [patch], last_off * spb + tail, mix_rate, false, seed)
+	last_stats = synth.last_offline_stats
 	synth.free()
 	return wav
 

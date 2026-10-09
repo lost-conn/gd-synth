@@ -786,12 +786,58 @@ func _render_voice_block(v: Voice, frames: int, dt: float, lfo_base: float) -> v
 # Rendering is deterministic: the RNG is reseeded from p_seed so noise and
 # humanization reproduce identically across bakes.
 #
+# Gain staging: live, each channel is clipped to ±1 on its own player and the
+# buses sum them in float. Offline there is one 16-bit stream, so the summed mix
+# has to be fitted into ±1 somehow — see [enum OfflineGain]. Every offline
+# render records its pre-clip peak and clipped-sample count in
+# [member last_offline_stats], so a bake can never clip unnoticed.
+#
 # Event shape mirrors the live command queue with a leading timestamp (seconds):
 #   [time, CMD_NOTE_ON,   channel, note, velocity, pan]
 #   [time, CMD_NOTE_OFF,  channel, note]
 #   [time, CMD_BEND,      channel, source_midi, target_freq, glide_seconds]
 #   [time, CMD_SET_PATCH, channel, patch]
 #   [time, CMD_ALL_OFF]
+
+## How an offline render fits the summed mix into the output's ±1 range.
+enum OfflineGain {
+	## Hard-clip the summed mix to ±1. The original bake behaviour, kept
+	## bit-identical for A/B; all 16 channels distort each other through one clipper.
+	CLIP,
+	## Never clip. If the mix peaks above [member offline_ceiling] the whole
+	## render is scaled down to it (never up); the factor is reported as "gain".
+	LIMIT_PEAK,
+	## Clip each channel to ±1 on its own — exactly what the live per-channel
+	## players do, so a patch that leans on that clip keeps its sound — then sum
+	## and treat the result as LIMIT_PEAK.
+	CHANNEL_CLIP,
+}
+
+## Gain staging for [method render_offline] / [method render_loop_offline].
+## The live path is unaffected.
+var offline_gain_mode: int = OfflineGain.LIMIT_PEAK
+
+## Peak ceiling (linear) for the non-clipping modes. 0.891 = -1 dBFS, leaving
+## room for a lossy re-encode of the bake to overshoot.
+var offline_ceiling: float = 0.891
+
+## Stats of the most recent offline render:
+##   mode             OfflineGain used
+##   mix_rate         Hz
+##   peak             largest |sample| of the summed mix before the sum is
+##                    clipped or scaled
+##   clipped_samples  sample values (L and R counted separately) hard-limited at
+##                    ±1 in the summed mix — always 0 outside CLIP
+##   channel_clipped_samples  values limited per channel (CHANNEL_CLIP only)
+##   samples          sample values rendered (incl. a loop's wrap tail)
+##   gain             linear scale applied to stay under the ceiling (1.0 = none)
+var last_offline_stats: Dictionary = {}
+
+# Running counters for the render in progress (see last_offline_stats).
+var _off_peak: float = 0.0
+var _off_clipped: int = 0
+var _off_channel_clipped: int = 0
+var _off_samples: int = 0
 
 ## Render [param events] (see shape above) against [param patches] (a
 ## per-channel Array[SynthPatch]; gaps fall back to a default patch) to a stereo
@@ -802,7 +848,7 @@ func render_offline(events: Array, patches: Array, total_seconds: float,
 		p_mix_rate: float = 22050.0, loop: bool = false, p_seed: int = 1234) -> AudioStreamWAV:
 	var frames: int = int(ceil(total_seconds * p_mix_rate))
 	var buf: Array = _render_events(events, patches, frames, p_mix_rate, p_seed)
-	return _make_wav(buf[0], buf[1], int(p_mix_rate), loop)
+	return _finish_offline(buf[0], buf[1], p_mix_rate, loop)
 
 ## Render a seamless looping bake of [param loop_seconds]. Renders an extra
 ## [param wrap_seconds] past the loop point and folds that overflow back onto
@@ -813,7 +859,8 @@ func render_loop_offline(events: Array, patches: Array, loop_seconds: float,
 	var loop_frames: int = int(round(loop_seconds * p_mix_rate))
 	var wrap_frames: int = int(round(wrap_seconds * p_mix_rate))
 	if loop_frames <= 0:
-		return _make_wav(PackedFloat32Array(), PackedFloat32Array(), int(p_mix_rate), true)
+		_reset_offline_counters(0)
+		return _finish_offline(PackedFloat32Array(), PackedFloat32Array(), p_mix_rate, true)
 	var buf: Array = _render_events(events, patches, loop_frames + wrap_frames, p_mix_rate, p_seed)
 	var l: PackedFloat32Array = buf[0]
 	var r: PackedFloat32Array = buf[1]
@@ -825,12 +872,13 @@ func render_loop_offline(events: Array, patches: Array, loop_seconds: float,
 		r[j] += r[i]
 	l.resize(loop_frames)
 	r.resize(loop_frames)
-	return _make_wav(l, r, int(p_mix_rate), true)
+	return _finish_offline(l, r, p_mix_rate, true)
 
 # Core offline mixdown: render [param total_frames] of [param events] through
 # [param patches] and return [out_l, out_r] float buffers. Reuses the live
 # per-voice DSP (_render_voice_block) so output matches real playback. Runs
-# synchronously; safe on an out-of-tree instance.
+# synchronously; safe on an out-of-tree instance. Only OfflineGain.CLIP limits
+# the summed mix here; the other modes return it unclipped for _finish_offline.
 func _render_events(events: Array, patches: Array, total_frames: int,
 		p_mix_rate: float, p_seed: int) -> Array:
 	mix_rate = p_mix_rate
@@ -840,6 +888,9 @@ func _render_events(events: Array, patches: Array, total_frames: int,
 	_age_counter = 0
 	_detune_ratios = PackedFloat32Array()
 	_create_voice_pool()
+	_reset_offline_counters(total_frames)
+	var hard_clip: bool = offline_gain_mode == OfflineGain.CLIP
+	var channel_clip: bool = offline_gain_mode == OfflineGain.CHANNEL_CLIP
 
 	if _default_patch == null:
 		_default_patch = SynthPatch.new()
@@ -884,20 +935,39 @@ func _render_events(events: Array, patches: Array, total_frames: int,
 				_render_voice_block(v, frames, dt, lfo_base)
 		_lfo_time = lfo_base + frames * dt
 
-		# Sum all channels into the stereo output, apply master gain + clip.
+		# Sum all channels into the stereo output and apply master gain, tracking
+		# the pre-clip peak. CHANNEL_CLIP limits each channel first (as its live
+		# player would); CLIP limits the sum (the original behaviour).
 		for i in frames:
 			var lx: float = 0.0
 			var rx: float = 0.0
-			for ch in CHANNEL_COUNT:
-				var b: int = ch * frames + i
-				lx += _mix_l[b]
-				rx += _mix_r[b]
-			lx *= master_gain
-			rx *= master_gain
-			if lx > 1.0: lx = 1.0
-			elif lx < -1.0: lx = -1.0
-			if rx > 1.0: rx = 1.0
-			elif rx < -1.0: rx = -1.0
+			if channel_clip:
+				for ch in CHANNEL_COUNT:
+					var b: int = ch * frames + i
+					var cl: float = _mix_l[b] * master_gain
+					var cr: float = _mix_r[b] * master_gain
+					if cl > 1.0: cl = 1.0; _off_channel_clipped += 1
+					elif cl < -1.0: cl = -1.0; _off_channel_clipped += 1
+					if cr > 1.0: cr = 1.0; _off_channel_clipped += 1
+					elif cr < -1.0: cr = -1.0; _off_channel_clipped += 1
+					lx += cl
+					rx += cr
+			else:
+				for ch in CHANNEL_COUNT:
+					var b: int = ch * frames + i
+					lx += _mix_l[b]
+					rx += _mix_r[b]
+				lx *= master_gain
+				rx *= master_gain
+			var al: float = absf(lx)
+			var ar: float = absf(rx)
+			if al > _off_peak: _off_peak = al
+			if ar > _off_peak: _off_peak = ar
+			if hard_clip:
+				if lx > 1.0: lx = 1.0; _off_clipped += 1
+				elif lx < -1.0: lx = -1.0; _off_clipped += 1
+				if rx > 1.0: rx = 1.0; _off_clipped += 1
+				elif rx < -1.0: rx = -1.0; _off_clipped += 1
 			out_l[frame + i] = lx
 			out_r[frame + i] = rx
 
@@ -932,6 +1002,46 @@ func _apply_event(e: Array) -> void:
 			_apply_all_notes_off()
 		CMD_SET_PATCH:
 			_apply_set_patch(e[2], e[3])
+
+func _reset_offline_counters(total_frames: int) -> void:
+	_off_peak = 0.0
+	_off_clipped = 0
+	_off_channel_clipped = 0
+	_off_samples = maxi(total_frames, 0) * 2
+
+# Gain-stage a finished float mix per offline_gain_mode, publish
+# last_offline_stats, and pack it. Runs after the loop fold, so a wrap tail that
+# stacks onto the loop start is measured (and, outside CLIP, scaled) too.
+func _finish_offline(l: PackedFloat32Array, r: PackedFloat32Array, rate: float, loop: bool) -> AudioStreamWAV:
+	var hard_clip: bool = offline_gain_mode == OfflineGain.CLIP
+	var peak: float = 0.0
+	for i in l.size():
+		var al: float = absf(l[i])
+		var ar: float = absf(r[i])
+		if al > peak: peak = al
+		if ar > peak: peak = ar
+		if hard_clip:
+			# Whatever the fold pushed back over ±1 is clamped by _make_wav.
+			if al > 1.0: _off_clipped += 1
+			if ar > 1.0: _off_clipped += 1
+	var gain: float = 1.0
+	if hard_clip:
+		peak = maxf(peak, _off_peak)  # the pre-clip peak, not the clipped one
+	elif peak > offline_ceiling and offline_ceiling > 0.0:
+		gain = offline_ceiling / peak
+		for i in l.size():
+			l[i] *= gain
+			r[i] *= gain
+	last_offline_stats = {
+		"mode": offline_gain_mode,
+		"mix_rate": rate,
+		"peak": peak,
+		"clipped_samples": _off_clipped,
+		"channel_clipped_samples": _off_channel_clipped,
+		"samples": _off_samples,
+		"gain": gain,
+	}
+	return _make_wav(l, r, int(rate), loop)
 
 # Pack float L/R buffers into a 16-bit stereo AudioStreamWAV.
 func _make_wav(l: PackedFloat32Array, r: PackedFloat32Array, rate: int, loop: bool) -> AudioStreamWAV:

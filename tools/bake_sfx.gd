@@ -10,8 +10,11 @@ extends EditorScript
 # Re-run whenever an SFX patch / pattern changes.
 
 const SfxBank = preload("res://scripts/audio/sfx_bank.gd")
+const SynthBaker = preload("res://addons/godot_synth/baker.gd")
+
+const MIX_RATE := SynthBaker.DEFAULT_MIX_RATE
 
 func _run() -> void:
 	var bank := SfxBank.new()
-	bank.bake_all()  # self-loads its resources when called on a bare instance
+	bank.bake_all(MIX_RATE)  # self-loads its resources when called on a bare instance
 	bank.free()
