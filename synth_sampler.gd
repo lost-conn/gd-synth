@@ -56,6 +56,11 @@ extends SynthEngine
 #   • Release ramps and glides are driven at the frame rate. The mixer joins the
 #     volume steps up into a line; a pitch step is a step (in pitch only — the
 #     waveform stays continuous).
+#
+# Live mode. Set [member live] before the node enters the tree and every method
+# of this script hands straight to SynthEngine's: the node is the plain live
+# synth, thread and generators and all, and none of the sampler's state is built.
+# It exists for comparing the two by ear without swapping scripts.
 
 ## Directory holding the baked sets, one per patch, named after the patch's
 ## file: resources/audio/patches/bass.tres plays <samples_dir>/bass.res.
@@ -70,6 +75,11 @@ extends SynthEngine
 ## Play a set whose patch has changed since it was baked (after warning once).
 ## Off, such a channel is silent until the set is re-baked.
 @export var allow_stale: bool = true
+
+## Run as the plain live [SynthEngine] instead of as a sampler (see "Live mode"
+## above). Read when the node enters the tree; set it before then — from a
+## subclass's _init(), say — and leave it alone afterwards.
+var live: bool = false
 
 # One sounding sample. Lives in _live from note_on until its stream ends, its
 # release ramp runs out, or it is stolen / cut.
@@ -139,6 +149,9 @@ const _MIN_RAMP := 0.012
 const _SILENCE := 0.00001
 
 func _ready() -> void:
+	if live:
+		super._ready()
+		return
 	_channel_buses.resize(CHANNEL_COUNT)
 	_channel_bus_names.resize(CHANNEL_COUNT)
 	_channel_sets.resize(CHANNEL_COUNT)
@@ -251,6 +264,9 @@ func _resolve_set(patch: SynthPatch) -> SynthSampleSet:
 ## Point [param channel] at the baked set of [param patch]. Notes already
 ## sounding on the channel are left alone, as live.
 func set_patch(channel: int, patch: SynthPatch) -> void:
+	if live:
+		super.set_patch(channel, patch)
+		return
 	if channel < 0 or channel >= CHANNEL_COUNT or patch == null:
 		return
 	_patches[channel] = patch
@@ -258,6 +274,9 @@ func set_patch(channel: int, patch: SynthPatch) -> void:
 
 ## Start a note. [param pan] is ignored (see the top of this file).
 func note_on(channel: int, note: float, velocity: float = 1.0, _pan: float = 0.0) -> void:
+	if live:
+		super.note_on(channel, note, velocity, _pan)
+		return
 	if not _enabled or channel < 0 or channel >= CHANNEL_COUNT:
 		return
 	var sample_set: SynthSampleSet = _channel_sets[channel]
@@ -322,6 +341,9 @@ func note_on(channel: int, note: float, velocity: float = 1.0, _pan: float = 0.0
 ## sample that has its own note-off in it, or has ended, is left to finish;
 ## anything else is taken to silence over the patch's release time.
 func note_off(channel: int, note: int) -> void:
+	if live:
+		super.note_off(channel, note)
+		return
 	if not _enabled:
 		return
 	for v in _live:
@@ -343,6 +365,9 @@ func note_off(channel: int, note: int) -> void:
 ## semitones, on the sample's pitch_scale. 0 seconds snaps. Calling again
 ## mid-glide carries on from where the pitch is.
 func bend_to(channel: int, source_midi: int, target_freq: float, glide_seconds: float) -> void:
+	if live:
+		super.bend_to(channel, source_midi, target_freq, glide_seconds)
+		return
 	if not _enabled:
 		return
 	var k: int = _live.size() - 1
@@ -365,6 +390,9 @@ func bend_to(channel: int, source_midi: int, target_freq: float, glide_seconds: 
 
 ## Cut every voice, no release.
 func all_notes_off() -> void:
+	if live:
+		super.all_notes_off()
+		return
 	if not _enabled:
 		return
 	_cut_all()
@@ -373,6 +401,9 @@ func all_notes_off() -> void:
 ## live engine's and are ignored. Changing the pool size drops the notes that
 ## are sounding, as the engine's configure() does.
 func configure(_p_mix_rate: float, _p_buffer_length: float, p_max_voices: int) -> void:
+	if live:
+		super.configure(_p_mix_rate, _p_buffer_length, p_max_voices)
+		return
 	var voices: int = maxi(1, p_max_voices)
 	if voices == max_voices:
 		return
@@ -387,6 +418,9 @@ func configure(_p_mix_rate: float, _p_buffer_length: float, p_max_voices: int) -
 ## Start [param channel]'s notes on [param bus] from now on, and move the ones
 ## that are sounding there.
 func set_channel_bus(channel: int, bus: StringName) -> void:
+	if live:
+		super.set_channel_bus(channel, bus)
+		return
 	if channel < 0 or channel >= CHANNEL_COUNT:
 		return
 	_channel_bus_names[channel] = bus
@@ -395,6 +429,8 @@ func set_channel_bus(channel: int, bus: StringName) -> void:
 			v.player.bus = bus
 
 func get_channel_bus(channel: int) -> StringName:
+	if live:
+		return super.get_channel_bus(channel)
 	if channel < 0 or channel >= CHANNEL_COUNT:
 		return &"Master"
 	return _channel_bus_names[channel]
@@ -402,6 +438,9 @@ func get_channel_bus(channel: int) -> StringName:
 ## Disabled, every voice is cut and notes are dropped until it is enabled again.
 ## Patches set meanwhile are kept.
 func set_enabled(p_enabled: bool) -> void:
+	if live:
+		super.set_enabled(p_enabled)
+		return
 	if p_enabled == _enabled:
 		return
 	_enabled = p_enabled
@@ -410,6 +449,12 @@ func set_enabled(p_enabled: bool) -> void:
 
 ## Voices sounding right now (never more than [member max_voices]).
 func get_voice_count() -> int:
+	if live:
+		var n: int = 0
+		for v in _voices:
+			if v.active:
+				n += 1
+		return n
 	_prune()
 	return _live.size()
 
@@ -418,6 +463,8 @@ func get_voice_count() -> int:
 # ---------------------------------------------------------------------------
 
 func _process(_delta: float) -> void:
+	if live:
+		return
 	var usec: int = Time.get_ticks_usec()
 	var delta: float = minf(float(usec - _frame_usec) * 0.000001, _MAX_FRAME)
 	_frame_usec = usec
