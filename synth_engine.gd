@@ -821,6 +821,14 @@ var offline_gain_mode: int = OfflineGain.LIMIT_PEAK
 ## room for a lossy re-encode of the bake to overshoot.
 var offline_ceiling: float = 0.891
 
+## Frames per offline render block. A block is the engine's control rate: events
+## take effect and filter coefficients are refreshed once per block, live and
+## offline alike. The default is the live block, so an offline render at the live
+## [member mix_rate] steps exactly as live does. A render at a higher rate that
+## should keep the live stepping — a filter sweep is audibly stepped — scales
+## this by the same factor.
+var offline_chunk: int = _MAX_CHUNK
+
 ## Stats of the most recent offline render:
 ##   mode             OfflineGain used
 ##   mix_rate         Hz
@@ -874,6 +882,20 @@ func render_loop_offline(events: Array, patches: Array, loop_seconds: float,
 	r.resize(loop_frames)
 	return _finish_offline(l, r, p_mix_rate, true)
 
+## Render [param events] and return the float mix as [code][left, right][/code]
+## (two [PackedFloat32Array]s of [param total_frames]) with [member master_gain]
+## applied and nothing else: no clip, no ceiling, no 16-bit packing. For callers
+## that gain-stage the result themselves — [SynthSampleBaker] sums two renders
+## made at different rates before it applies the per-channel clip. Leaves
+## [member last_offline_stats] alone. Honours [member offline_chunk].
+func render_offline_raw(events: Array, patches: Array, total_frames: int,
+		p_mix_rate: float = 22050.0, p_seed: int = 1234) -> Array:
+	var mode: int = offline_gain_mode
+	offline_gain_mode = OfflineGain.LIMIT_PEAK  # the mode that leaves the sum unclipped
+	var buf: Array = _render_events(events, patches, total_frames, p_mix_rate, p_seed)
+	offline_gain_mode = mode
+	return buf
+
 # Core offline mixdown: render [param total_frames] of [param events] through
 # [param patches] and return [out_l, out_r] float buffers. Reuses the live
 # per-voice DSP (_render_voice_block) so output matches real playback. Runs
@@ -914,7 +936,7 @@ func _render_events(events: Array, patches: Array, total_frames: int,
 	var ev_i: int = 0
 	var frame: int = 0
 	while frame < total_frames:
-		var frames: int = mini(_MAX_CHUNK, total_frames - frame)
+		var frames: int = mini(maxi(offline_chunk, 1), total_frames - frame)
 		# Apply every event scheduled to start before this block's end, matching
 		# the live engine's per-iteration command-drain cadence.
 		var block_end_time: float = float(frame + frames) * dt

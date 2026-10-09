@@ -75,6 +75,7 @@ This means the synth is happily reusable for SFX even without music playing, the
 | `PatternNote` | inline sub-resource | Footer of the pattern editor. |
 | `MusicBlock` | inline or `.tres` | Inspector. Defines one chord + scale + duration. |
 | `MusicData` | `.tres` | Inspector. A list of MusicBlocks plus BPM. |
+| `SynthSampleSet` | `.res` | Nowhere — `SynthSampleBaker` makes it. A patch, baked to samples. |
 
 ## Editor tools
 
@@ -84,6 +85,23 @@ This means the synth is happily reusable for SFX even without music playing, the
 ## SFX without the music side
 
 If you only want the synth (no chord progression, no patterns, just trigger-a-sound-on-an-event), you can skip the music director entirely. Use `SynthEngine` directly, or build your own thin dispatcher with a pool of `MusicTrack` nodes pre-configured for one-shot patterns. There's a worked example in the parent project this addon was extracted from.
+
+## Baking
+
+Rendering every voice in GDScript is the expensive way to make a sound. Two ways out, both built on `SynthEngine`'s offline renderer (same DSP, no audio thread):
+
+- **`SynthBaker`** flattens a whole song, or one SFX pattern, to a single `AudioStreamWAV`. Costs nothing to play; no longer follows the chord progression, because it is a recording of one.
+- **`SynthSampleBaker`** turns a `SynthPatch` into a `SynthSampleSet`: single notes, recorded at the pitches, velocities and lengths your patterns actually play them. A sampler then pitches and mixes those through Godot's mixer while the director and tracks keep sequencing as before. `sample_set.gd` spells out what that sampler has to do; `sample_baker.gd` explains how the notes are recorded (why noise is rendered at the live rate, where loops go, why a decaying note is recorded with its note-off).
+
+```gdscript
+var usage := SynthSampleBaker.Usage.new()
+SynthSampleBaker.add_pattern_usage(usage, pattern, MusicTrack.TrackType.DRUM, 4, [], 120.0)
+var sample_set := SynthSampleBaker.bake(patch, usage)
+ResourceSaver.save(sample_set, "res://samples/kick.res")
+print(SynthSampleBaker.last_report)   # roots, peak, what clipped, bytes
+```
+
+A set remembers the patch it came from: `sample_set.is_stale(patch)` says when to bake again.
 
 ## Channel allocation
 
