@@ -1,3 +1,4 @@
+@tool
 class_name MusicTrack
 extends Node
 
@@ -142,7 +143,18 @@ var _play_once_token: int = 0
 # Lifecycle
 # ---------------------------------------------------------------------------
 
+## Editor-only opt-in. This script is @tool so the Synth editor tab can run a
+## preview track inside the editor; a MusicTrack sitting in a scene that is
+## merely open in the editor must stay inert (no autoload lookup, no autoplay,
+## no _process). Only a node with this set to true BEFORE it enters the tree
+## (the tab's preview track) wires itself while Engine.is_editor_hint(). Ignored
+## in a running game. Not exported, so it is never saved into a scene.
+var editor_preview: bool = false
+
 func _ready() -> void:
+	if Engine.is_editor_hint() and not editor_preview:
+		set_process(false)
+		return
 	if director == null:
 		director = get_node_or_null("/root/Music") as MusicDirector
 	if synth == null:
@@ -239,6 +251,11 @@ func refresh_bus() -> void:
 
 func _configure_bus() -> void:
 	if synth == null:
+		return
+	# The editor's AudioServer is the editor's own (its Audio panel edits and
+	# saves the project's bus layout). The preview plays dry on Master and must
+	# not add auto-buses to it.
+	if Engine.is_editor_hint():
 		return
 	synth.ensure_channel_bus(synth_channel, effects, output_bus)
 

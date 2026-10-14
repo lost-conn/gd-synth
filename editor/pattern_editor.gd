@@ -1,15 +1,26 @@
+@tool
 extends PanelContainer
 
-# Runtime editor for MusicPattern resources. Top-level chrome around a
+# Editor for MusicPattern resources. Top-level chrome around a
 # PianoRoll: toolbar (new/load/save, track type, length, snap), a scroll
 # container hosting the piano roll, and a footer panel with note
 # properties for the currently selected note.
+#
+# Preview playback goes through a SynthPreview (one engine + director + track).
+# Standalone (an F6 run, pattern_editor_demo.tscn) the editor builds its own on
+# first Play. Hosted by the Synth tab it is handed the tab's shared one with
+# bind_preview(), so the pattern is heard through the tab's current patch and
+# music data, and the Data/Patch buttons here change that shared state.
 
-const PianoRollScript := preload("uid://5xhqwgw3xrfc")
+const PianoRollScript := preload("./piano_roll.gd")
+const DEFAULT_DATA_LABEL := "(default: 120 BPM, C major)"
+const DEFAULT_PATCH_LABEL := "(default organ)"
 
 ## MusicData used when previewing the pattern. Assign a .tres in the
 ## inspector or via the toolbar button. Provides chord/scale context so
-## CHORD and MELODY tracks resolve to real pitches.
+## CHORD and MELODY tracks resolve to real pitches. Null previews against a
+## built-in default (120 BPM, C major) so Play always works. Used to seed the
+## editor's own preview; when a shared preview is bound, that one decides.
 @export var preview_music_data: MusicData
 
 ## SynthPatch (timbre) used for preview playback. Defaults to organ if null.
@@ -21,9 +32,9 @@ const PianoRollScript := preload("uid://5xhqwgw3xrfc")
 var pattern: MusicPattern
 var current_path: String = ""
 
-var _preview_synth: SynthEngine
-var _preview_director: MusicDirector
-var _preview_track: MusicTrack
+# The preview rig: bound from outside (shared) or built here on first use (own).
+var _preview: SynthPreview
+var _preview_is_own: bool = false
 
 var _piano_roll: PianoRoll
 var _track_type_option: OptionButton
@@ -54,7 +65,10 @@ var _bend_footer: VBoxContainer
 var _suppress: bool = false
 
 func _ready() -> void:
-	custom_minimum_size = Vector2(960, 520)
+	# Don't write layout into a scene that is merely open in the editor (it would
+	# be saved with it); the Synth tab sizes this control itself.
+	if not Engine.is_editor_hint():
+		custom_minimum_size = Vector2(960, 520)
 	_build_ui()
 	if pattern == null:
 		pattern = MusicPattern.new()
@@ -62,14 +76,15 @@ func _ready() -> void:
 	_piano_roll.pattern = pattern
 	_refresh_toolbar()
 	_refresh_footer()
+	_refresh_preview_labels()
 
 func set_pattern(p: MusicPattern) -> void:
 	pattern = p
 	_selected_note = null
 	if _piano_roll:
 		_piano_roll.pattern = p
-	if _preview_track:
-		_preview_track.pattern = p
+	if _preview:
+		_preview.set_pattern(p)
 	_refresh_toolbar()
 	_refresh_footer()
 
@@ -168,9 +183,10 @@ func _build_preview_bar(parent: VBoxContainer) -> void:
 	_data_btn = Button.new()
 	_data_btn.text = "Load MusicData..."
 	_data_btn.pressed.connect(func(): _data_dialog.popup_centered())
+	_data_btn.tooltip_text = "Chord progression and tempo the pattern is previewed against."
 	row.add_child(_data_btn)
 	_data_label = Label.new()
-	_data_label.text = _resource_label(preview_music_data, "(none)")
+	_data_label.text = _resource_label(preview_music_data, DEFAULT_DATA_LABEL)
 	_data_label.add_theme_color_override("font_color", Color(0.70, 0.72, 0.78))
 	row.add_child(_data_label)
 
@@ -182,7 +198,7 @@ func _build_preview_bar(parent: VBoxContainer) -> void:
 	_patch_btn.pressed.connect(func(): _patch_dialog.popup_centered())
 	row.add_child(_patch_btn)
 	_patch_label = Label.new()
-	_patch_label.text = _resource_label(preview_patch, "(default organ)")
+	_patch_label.text = _resource_label(preview_patch, DEFAULT_PATCH_LABEL)
 	_patch_label.add_theme_color_override("font_color", Color(0.70, 0.72, 0.78))
 	row.add_child(_patch_label)
 
@@ -443,8 +459,8 @@ func _on_pattern_changed() -> void:
 
 func _on_track_type_changed(idx: int) -> void:
 	_piano_roll.track_type = _track_type_option.get_item_id(idx)
-	if _preview_track:
-		_preview_track.track_type = _piano_roll.track_type
+	if _preview:
+		_preview.set_track_type(_piano_roll.track_type)
 
 func _on_length_changed(v: float) -> void:
 	if _suppress or pattern == null:
@@ -543,13 +559,82 @@ func _on_load_path_chosen(path: String) -> void:
 # Preview playback
 # ---------------------------------------------------------------------------
 
+## Use a preview owned by someone else (the Synth tab's shared one) instead of
+## building a private one. Call after this node is in the tree, with a preview
+## that ensure_started() has already run on.
+func bind_preview(p: SynthPreview) -> void:
+	_unbind_preview()
+	if _preview != null and _preview_is_own:
+		_preview.shutdown()
+		_preview.queue_free()
+	_preview = p
+	_preview_is_own = false
+	_hook_preview()
+	_refresh_preview_labels()
+
+func _unbind_preview() -> void:
+	if _preview == null:
+		return
+	if _preview.playing_changed.is_connected(_on_preview_playing_changed):
+		_preview.playing_changed.disconnect(_on_preview_playing_changed)
+	if _preview.patch_changed.is_connected(_on_preview_patch_changed):
+		_preview.patch_changed.disconnect(_on_preview_patch_changed)
+	if _preview.music_data_changed.is_connected(_on_preview_data_changed):
+		_preview.music_data_changed.disconnect(_on_preview_data_changed)
+	if _piano_roll != null and _piano_roll.director == _preview.director:
+		_piano_roll.director = null
+
+func _hook_preview() -> void:
+	_preview.playing_changed.connect(_on_preview_playing_changed)
+	_preview.patch_changed.connect(_on_preview_patch_changed)
+	_preview.music_data_changed.connect(_on_preview_data_changed)
+	_preview.ensure_started()
+	_piano_roll.director = _preview.director
+	_preview.set_pattern(pattern)
+
+# Build this editor's own preview, seeded from the exports. Only used when
+# nothing was bound.
+func _ensure_preview() -> void:
+	if _preview != null:
+		_preview.ensure_started()
+		return
+	_preview = SynthPreview.new()
+	_preview.name = "Preview"
+	_preview_is_own = true
+	_preview.music_data = preview_music_data
+	_preview.patch = preview_patch
+	add_child(_preview)
+	_hook_preview()
+	_preview.set_base_octave(preview_base_octave)
+	_preview.set_track_type(_piano_roll.track_type)
+
+func _refresh_preview_labels() -> void:
+	if _data_label == null:
+		return
+	var data: MusicData = preview_music_data
+	var pt: SynthPatch = preview_patch
+	if _preview != null:
+		data = _preview.music_data
+		pt = _preview.patch
+	_data_label.text = _resource_label(data, DEFAULT_DATA_LABEL)
+	_patch_label.text = _resource_label(pt, DEFAULT_PATCH_LABEL)
+
+func _on_preview_playing_changed(_playing: bool) -> void:
+	_update_play_button()
+
+func _on_preview_patch_changed(_p: SynthPatch) -> void:
+	_refresh_preview_labels()
+
+func _on_preview_data_changed(_d: MusicData) -> void:
+	_refresh_preview_labels()
+
 func _on_data_path_chosen(path: String) -> void:
 	var res := load(path)
 	if res is MusicData:
 		preview_music_data = res
-		_data_label.text = _resource_label(res, "(none)")
-		if _is_previewing():
-			_preview_director.swap_data(res, MusicDirector.SwapMode.IMMEDIATE)
+		_ensure_preview()
+		_preview.set_music_data(res)
+		_refresh_preview_labels()
 	else:
 		push_warning("[PatternEditor] Not a MusicData: " + path)
 
@@ -557,75 +642,44 @@ func _on_patch_path_chosen(path: String) -> void:
 	var res := load(path)
 	if res is SynthPatch:
 		preview_patch = res
-		_patch_label.text = _resource_label(res, "(default organ)")
-		if _preview_track and _preview_synth:
-			_preview_track.patch = res
-			_preview_synth.set_patch(_preview_track.synth_channel, res)
+		_ensure_preview()
+		_preview.set_patch(res)
+		_refresh_preview_labels()
 	else:
 		push_warning("[PatternEditor] Not a SynthPatch: " + path)
 
 func _on_octave_changed(v: float) -> void:
 	preview_base_octave = int(v)
-	if _preview_track:
-		_preview_track.base_octave = preview_base_octave
+	if _preview:
+		_preview.set_base_octave(preview_base_octave)
 
 func _on_play_pressed() -> void:
-	if _is_previewing():
-		_stop_preview()
+	if is_previewing():
+		stop_preview()
 	else:
-		_start_preview()
-	_update_play_button()
+		start_preview()
 
-func _is_previewing() -> bool:
-	return _preview_director != null and _preview_director.playing
+func is_previewing() -> bool:
+	return _preview != null and _preview.is_playing()
 
 func _update_play_button() -> void:
-	_play_btn.text = "Stop" if _is_previewing() else "Play"
+	if _play_btn != null:
+		_play_btn.text = "Stop" if is_previewing() else "Play"
 
-func _ensure_preview_nodes() -> void:
-	if _preview_synth != null:
-		return
-	_preview_synth = SynthEngine.new()
-	_preview_synth.name = "PreviewSynth"
-	add_child(_preview_synth)
-	_preview_director = MusicDirector.new()
-	_preview_director.name = "PreviewDirector"
-	add_child(_preview_director)
-	_preview_track = MusicTrack.new()
-	_preview_track.name = "PreviewTrack"
-	# Pre-set runtime refs + disable autoplay BEFORE add_child, so the
-	# track's _ready doesn't grab the global /root/Music and /root/Synth
-	# autoloads (which would route preview audio through the main game's
-	# synth instead of our isolated preview synth).
-	_preview_track.director = _preview_director
-	_preview_track.synth = _preview_synth
-	_preview_track.autoplay = false
-	add_child(_preview_track)
-	_piano_roll.director = _preview_director
-
-func _start_preview() -> void:
+## Play the pattern through the preview, from the top of the progression.
+func start_preview() -> void:
 	if pattern == null:
 		push_warning("[PatternEditor] No pattern to preview.")
 		return
-	if preview_music_data == null:
-		push_warning("[PatternEditor] Set preview_music_data to enable playback.")
-		return
-	_ensure_preview_nodes()
-	var patch_to_use: SynthPatch = preview_patch if preview_patch != null else SynthPatch.make_organ()
-	_preview_track.track_type = _piano_roll.track_type
-	_preview_track.pattern = pattern
-	_preview_track.patch = patch_to_use
-	_preview_track.synth_channel = 0
-	_preview_track.base_octave = preview_base_octave
-	_preview_track.activate()
-	_preview_director.data = preview_music_data
-	_preview_director.play()
+	_ensure_preview()
+	_preview.play_pattern(pattern, _piano_roll.track_type, preview_base_octave)
+	_update_play_button()
 
-func _stop_preview() -> void:
-	if _preview_director:
-		_preview_director.stop()
-	if _preview_synth:
-		_preview_synth.all_notes_off()
+func stop_preview() -> void:
+	if _preview != null:
+		_preview.stop()
+	_update_play_button()
 
 func _exit_tree() -> void:
-	_stop_preview()
+	if _preview != null and _preview_is_own:
+		_preview.stop()

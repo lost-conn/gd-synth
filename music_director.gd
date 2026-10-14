@@ -1,3 +1,4 @@
+@tool
 class_name MusicDirector
 extends Node
 
@@ -46,7 +47,18 @@ var _pending_mode: int = -1
 # Playback control
 # ---------------------------------------------------------------------------
 
+## Editor-only opt-in. This script is @tool so the Synth editor tab can run a
+## preview director inside the editor; a MusicDirector sitting in a scene that
+## is merely open in the editor must stay inert (no autoplay, no _process).
+## Only a node with this set to true BEFORE it enters the tree (the tab's
+## preview director) ticks while Engine.is_editor_hint(). Ignored in a running
+## game. Not exported, so it is never saved into a scene.
+var editor_preview: bool = false
+
 func _ready() -> void:
+	if Engine.is_editor_hint() and not editor_preview:
+		set_process(false)
+		return
 	if autoplay and data != null and not data.blocks.is_empty():
 		call_deferred("play")
 

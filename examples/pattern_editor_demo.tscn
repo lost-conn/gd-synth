@@ -1,6 +1,6 @@
 [gd_scene format=3 uid="uid://dpatdemo0001"]
 
-[ext_resource type="PackedScene" uid="uid://dpatedit0001" path="res://addons/godot_synth/editor/pattern_editor.tscn" id="1_editor"]
+[ext_resource type="PackedScene" uid="uid://bhmixyw2l8xuk" path="res://addons/godot_synth/editor/pattern_editor.tscn" id="1_editor"]
 
 [node name="PatternEditorDemo" type="Control"]
 anchors_preset = 15

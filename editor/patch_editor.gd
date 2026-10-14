@@ -1,12 +1,15 @@
+@tool
 extends PanelContainer
 
-# Live patch designer. Edit harmonics, ADSR, filter, detune, vibrato; load
+# Patch designer. Edit harmonics, ADSR, filter, detune, vibrato; load
 # and save SynthPatch resources. The editor mutates the active patch in
 # place so currently-sustaining voices reflect changes immediately.
 # Loading or selecting a preset swaps the reference and emits patch_changed.
 #
 # Wiring: assign `synth`, add to scene tree, then call set_patch() with the
-# starting patch. See music_test.gd for an example.
+# starting patch. See music_test.gd for an example. Hosted by the Synth tab,
+# `synth` is the tab's shared preview engine, and patch_changed tells the tab
+# which patch the other views should now play.
 
 signal patch_changed(patch: SynthPatch)
 
@@ -15,6 +18,10 @@ const HARMONIC_SLOTS := 10
 var synth: SynthEngine
 var patch: SynthPatch
 var current_path: String = ""
+
+## The footer hint lists the music_test demo's keyboard shortcuts. A host that
+## has no such keys (the Synth tab) sets this false before adding the editor.
+var show_demo_hints: bool = true
 
 var _name_edit: LineEdit
 var _waveform_option: OptionButton
@@ -29,8 +36,11 @@ var _load_dialog: FileDialog
 var _suppress: bool = false
 
 func _ready() -> void:
-	custom_minimum_size = Vector2(640, 0)
-	mouse_filter = Control.MOUSE_FILTER_STOP
+	# Don't write layout into a scene that is merely open in the editor (it would
+	# be saved with it); the Synth tab sizes this control itself.
+	if not Engine.is_editor_hint():
+		custom_minimum_size = Vector2(640, 0)
+		mouse_filter = Control.MOUSE_FILTER_STOP
 	_build_ui()
 	if patch != null:
 		_refresh_from_patch()
@@ -193,8 +203,7 @@ func _build_params(parent: VBoxContainer) -> void:
 	_add_slider_row(grid, "decay", "Decay (s)", 0.0, 3.0, 0.001)
 	_add_slider_row(grid, "sustain", "Sustain", 0.0, 1.0, 0.01)
 	_add_slider_row(grid, "release", "Release (s)", 0.0, 3.0, 0.001)
-	# Gain / legacy LP
-	_add_slider_row(grid, "lowpass", "Lowpass (legacy)", 0.0, 1.0, 0.01)
+	# Gain
 	_add_slider_row(grid, "gain", "Gain", 0.0, 1.0, 0.01)
 	# Unison
 	_add_int_spin_row(grid, "detune_voices", "Detune voices", 1, 4)
@@ -273,10 +282,11 @@ func _build_test_row(parent: VBoxContainer) -> void:
 	test_btn.text = "Test note (C4)"
 	test_btn.pressed.connect(_test_note)
 	row.add_child(test_btn)
-	var hint := Label.new()
-	hint.text = "  Keys A..; piano  •  Z/X octave  •  Space MIDI  •  F1 hide editor"
-	hint.add_theme_color_override("font_color", Color(0.7, 0.7, 0.7))
-	row.add_child(hint)
+	if show_demo_hints:
+		var hint := Label.new()
+		hint.text = "  Keys A..; piano  •  Z/X octave  •  Space MIDI  •  F1 hide editor"
+		hint.add_theme_color_override("font_color", Color(0.7, 0.7, 0.7))
+		row.add_child(hint)
 
 func _build_dialogs() -> void:
 	_save_dialog = FileDialog.new()

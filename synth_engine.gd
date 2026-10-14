@@ -1,3 +1,4 @@
+@tool
 class_name SynthEngine
 extends Node
 
@@ -139,7 +140,17 @@ var _detune_ratios: PackedFloat32Array = PackedFloat32Array()
 
 const CHANNEL_COUNT := 16
 
+## Editor-only opt-in. This script is @tool so the Synth editor tab can run a
+## preview engine inside the editor, but a SynthEngine that merely sits in a
+## scene being edited must stay inert: no players, no render thread. Only a
+## node that has this set to true BEFORE it enters the tree (the tab's preview
+## engine) builds its audio pipeline while Engine.is_editor_hint(). Ignored in
+## a running game. Not exported, so it is never saved into a scene.
+var editor_preview: bool = false
+
 func _ready() -> void:
+	if Engine.is_editor_hint() and not editor_preview:
+		return
 	_channel_players.resize(CHANNEL_COUNT)
 	_channel_playbacks.resize(CHANNEL_COUNT)
 	_channel_buses.resize(CHANNEL_COUNT)
@@ -321,6 +332,8 @@ func _unique_bus_name(base: StringName) -> StringName:
 func _exit_tree() -> void:
 	# Stop the render thread before tearing down buses/playbacks it reads.
 	_stop_thread()
+	if _channel_buses.size() != CHANNEL_COUNT:
+		return  # inert editor-time instance: _ready never built anything
 	for ch in CHANNEL_COUNT:
 		release_channel_bus(ch)
 

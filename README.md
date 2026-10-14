@@ -11,8 +11,7 @@ A wavetable synthesizer, dynamic music system, and runtime SFX bank for Godot 4.
 - **Per-channel audio buses** routed through Godot's mixer, so you get reverb / delay / EQ / compression for free via Godot's built-in `AudioEffect` nodes.
 - **Dynamic music director.** Define a chord progression once, then write patterns as scale degrees or chord tones. The melody automatically harmonizes with whatever chord is active. Swap progressions at runtime without restarting the song.
 - **MIDI file parser** because you might want to import that demo from 1996.
-- **Visual pattern editor** with a piano roll, marquee select, copy/paste, movable playhead, and live preview against any patch. Click around. Make noise.
-- **Patch designer** with sliders for every parameter and ten or so factory presets to deconstruct.
+- **A Synth tab in the editor** with a patch designer (sliders for every parameter, a pile of factory presets), a visual pattern editor (piano roll, marquee select, copy/paste, movable playhead) and a track list, all auditioning through one shared live preview. Click around. Make noise.
 
 ## Installation
 
@@ -22,7 +21,9 @@ Drop the addon into your project at `addons/godot_synth/`. Or add as a git submo
 git submodule add https://github.com/lost-conn/gd-synth.git addons/godot_synth
 ```
 
-That's it. No editor plugin to enable — the classes register themselves via `class_name`. The `examples/music_test.tscn` scene is F6-able as soon as the addon is in your project.
+The classes register themselves via `class_name`, so the runtime needs nothing enabled. To get the **Synth** editor tab (below), enable the plugin in Project > Project Settings > Plugins. The `examples/music_test.tscn` scene is F6-able as soon as the addon is in your project.
+
+Nothing in the addon hardcodes its install folder: the code uses relative `preload("./...")` paths and the example scenes reference scripts by UID, so `addons/godot_synth/` and `addons/gd-synth/` both work.
 
 ## Quick start: making a noise
 
@@ -70,8 +71,8 @@ This means the synth is happily reusable for SFX even without music playing, the
 
 | Class | Saved as | Edit it in |
 |---|---|---|
-| `SynthPatch` | `.tres` | The patch editor. Or the inspector. Or notepad if you're feeling brave. |
-| `MusicPattern` | `.tres` | The piano-roll pattern editor. |
+| `SynthPatch` | `.tres` | The Synth tab's Sound view. Or the inspector. Or notepad if you're feeling brave. |
+| `MusicPattern` | `.tres` | The Synth tab's Pattern view (piano roll). |
 | `PatternNote` | inline sub-resource | Footer of the pattern editor. |
 | `MusicBlock` | inline or `.tres` | Inspector. Defines one chord + scale + duration. |
 | `MusicData` | `.tres` | Inspector. A list of MusicBlocks plus BPM. |
@@ -79,8 +80,31 @@ This means the synth is happily reusable for SFX even without music playing, the
 
 ## Editor tools
 
-- `addons/godot_synth/editor/pattern_editor.tscn` — visual pattern editor. F6-able. Loads/saves `MusicPattern.tres`. Has a piano roll, copy/paste, marquee select, and a movable playhead. Configure a `preview_music_data` and `preview_patch` in the inspector to play patterns back live.
-- `addons/godot_synth/examples/music_test.tscn` — the demo scene. Shows the patch editor and the pattern editor side-by-side, includes a typing-keyboard piano (A-K), and a sample song that toggles with F2.
+### The Synth tab
+
+Enable the plugin and a **Synth** tab appears next to 2D / 3D / Script. It is one workspace with three views, switched from the bar at the top:
+
+- **Sound** hosts the patch editor: harmonics, envelope, filter, FM, noise, presets, load/save of `SynthPatch` resources.
+- **Pattern** hosts the pattern editor: a piano roll (marquee select, copy/paste, bends, a movable playhead) with a note inspector, load/save of `MusicPattern` resources.
+- **Track** lists the `MusicTrack` nodes of a music scene you pick (a `.tscn`): name, type, pattern, patch, channel, octave. Read-only for now.
+
+The bar also has a transport (**Play** / **Stop** / **Loop**), a readout of the previewed `MusicData` (BPM, key, and the progression as chord symbols, with the current block lit while playing), and a chip on the right for sample-bake status.
+
+Double-click a `SynthPatch`, `MusicPattern` or `MusicData` `.tres` in the FileSystem dock and the editor jumps to the Synth tab and opens it in the matching view. (Selecting one of those resources anywhere else, such as clicking a track's `patch` property in the inspector, does the same: that is how Godot treats a main-screen editor.)
+
+**One shared preview.** The tab owns a single `SynthEngine`, `MusicDirector` and preview `MusicTrack`, and never touches a game's `/root/Synth` or `/root/Music` autoloads. Both editors play through them, and the *current patch* is shared: tweak a patch in Sound, switch to Pattern, press Play, and the pattern is heard through that same patch as it is right now. Pick a different patch from the Pattern view and Sound follows. If no `MusicData` is chosen, previews run against a built-in default (120 BPM, C major, one block), so Play always works. Loop off plays once through the progression (or the pattern, if it is longer) and stops. Switching to another editor tab stops playback and idles the engine.
+
+The preview plays dry on the editor's Master bus: a track's `output_bus` and `effects` are ignored in the editor so the preview never adds buses to the editor's own AudioServer.
+
+### `@tool` scripts
+
+The editor tab runs the real engine classes inside the editor, so they are `@tool`: `SynthEngine`, `MusicDirector`, `MusicTrack` and the resources `SynthPatch`, `MusicPattern`, `PatternNote`, `PatternBend`, `MusicBlock`, `MusicData`, plus the editor scripts. A `SynthEngine`, `MusicDirector` or `MusicTrack` that merely sits in a scene you have open in the editor stays inert: no audio, no autoplay, no ticking, no autoload lookup. Only a node whose `editor_preview` is set to `true` before it enters the tree (the tab's own preview nodes) comes alive while `Engine.is_editor_hint()`. `editor_preview` is not exported, so it is never saved into a scene.
+
+### Standalone
+
+- `addons/godot_synth/editor/pattern_editor.tscn` — the pattern editor on its own. F6-able. It builds a private preview on first Play; configure `preview_music_data` and `preview_patch` in the inspector to choose what it plays against (with none, the built-in default).
+- `addons/godot_synth/examples/music_test.tscn` — the demo scene. Shows the patch editor, includes a typing-keyboard piano (A-K), and a sample song that toggles with F2.
+- `addons/godot_synth/examples/pattern_editor_demo.tscn` — the pattern editor in a bare scene.
 
 ## SFX without the music side
 

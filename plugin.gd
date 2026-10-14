@@ -1,0 +1,63 @@
+@tool
+extends EditorPlugin
+
+# Adds a "Synth" tab to the editor's main-screen row (next to 2D / 3D / Script):
+# a Sound / Pattern / Track workspace over one shared preview synth. See
+# editor/synth_main_screen.gd.
+#
+# Double-clicking a SynthPatch, MusicPattern or MusicData .tres in the FileSystem
+# dock switches to the tab and opens it in the matching view.
+#
+# Paths are relative (preload("./...")): the addon is installed as
+# addons/godot_synth/ in some projects and addons/gd-synth/ in others.
+
+const MainScreenScript := preload("./editor/synth_main_screen.gd")
+
+var _main_screen: Control
+
+func _enter_tree() -> void:
+	_main_screen = MainScreenScript.new()
+	_main_screen.name = "SynthMainScreen"
+	EditorInterface.get_editor_main_screen().add_child(_main_screen)
+	_make_visible(false)
+
+func _exit_tree() -> void:
+	if _main_screen != null:
+		# Hide first so the preview stops and the engine's thread is released,
+		# then free the whole tab (preview nodes, dialogs and all).
+		_main_screen.set_active(false)
+		if _main_screen.get_parent() != null:
+			_main_screen.get_parent().remove_child(_main_screen)
+		_main_screen.free()
+		_main_screen = null
+
+func _has_main_screen() -> bool:
+	return true
+
+func _get_plugin_name() -> String:
+	return "Synth"
+
+func _get_plugin_icon() -> Texture2D:
+	var theme := EditorInterface.get_editor_theme()
+	if theme != null and theme.has_icon("AudioStreamPlayer", "EditorIcons"):
+		return theme.get_icon("AudioStreamPlayer", "EditorIcons")
+	return null
+
+func _make_visible(visible: bool) -> void:
+	if _main_screen == null:
+		return
+	_main_screen.visible = visible
+	_main_screen.set_active(visible)
+
+func _handles(object: Object) -> bool:
+	return object is SynthPatch or object is MusicPattern or object is MusicData
+
+func _edit(object: Object) -> void:
+	if _main_screen == null or object == null:
+		return
+	if object is SynthPatch:
+		_main_screen.open_patch(object)
+	elif object is MusicPattern:
+		_main_screen.open_pattern(object)
+	elif object is MusicData:
+		_main_screen.open_music_data(object)
