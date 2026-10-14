@@ -1,3 +1,4 @@
+@tool
 class_name SynthSampler
 extends SynthEngine
 
@@ -149,6 +150,11 @@ const _MIN_RAMP := 0.012
 const _SILENCE := 0.00001
 
 func _ready() -> void:
+	# @tool so the Synth editor tab can audition baked sets; a sampler that merely
+	# sits in a scene open in the editor stays inert, as the engine does (see
+	# SynthEngine.editor_preview).
+	if Engine.is_editor_hint() and not editor_preview:
+		return
 	if live:
 		super._ready()
 		return
@@ -463,7 +469,7 @@ func get_voice_count() -> int:
 # ---------------------------------------------------------------------------
 
 func _process(_delta: float) -> void:
-	if live:
+	if live or (Engine.is_editor_hint() and not editor_preview):
 		return
 	var usec: int = Time.get_ticks_usec()
 	var delta: float = minf(float(usec - _frame_usec) * 0.000001, _MAX_FRAME)

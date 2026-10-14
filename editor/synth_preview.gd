@@ -17,6 +17,11 @@ extends Node
 #                 (see make_default_music_data), so play() always has something.
 #   - the pattern being played (play_pattern).
 #
+# Auditioning single notes (the Sound view's keyboard) goes through the same rig:
+# Live plays them on the SynthEngine above, Baked on a SynthSampler that is built
+# the first time a baked note is asked for and plays the patch's SynthSampleSet
+# (set_audition_set). Neither is the game's /root/Synth.
+#
 # The nodes are built on ensure_started(), not on _ready, so a tab nobody opens
 # costs nothing. suspend()/resume() stop and restart the engine's render thread
 # (the thread renders silence at full cost otherwise).
@@ -25,6 +30,9 @@ signal started
 signal playing_changed(playing: bool)
 signal patch_changed(patch: SynthPatch)
 signal music_data_changed(data: MusicData)
+## A note was auditioned. [param engine] is &"live" (SynthEngine), &"baked"
+## (SynthSampler) or &"none" (baked asked for, no set to play).
+signal audition_played(engine: StringName, note: int)
 
 ## Channel the preview track and the patch editor's test note share.
 const CHANNEL := 0
@@ -32,6 +40,12 @@ const CHANNEL := 0
 var synth: SynthEngine
 var director: MusicDirector
 var track: MusicTrack
+## Plays baked sets for the Sound view's Baked audition. Built on first use.
+var sampler: SynthSampler
+## The baked set of the current patch (null = none), for the Baked audition.
+var audition_set: SynthSampleSet
+## Which engine the most recent audition note went to (&"live" / &"baked" / &"none").
+var last_audition_engine: StringName = &""
 
 ## The current patch (timbre). Null plays the default organ.
 var patch: SynthPatch
@@ -42,6 +56,8 @@ var music_data: MusicData
 var loop: bool = true
 
 var _suspended: bool = false
+# Auditioned notes still held: midi -> the engine that started them.
+var _held: Dictionary = {}
 var _last_playing: bool = false
 var _end_beat: float = -1.0
 var _default_data: MusicData
@@ -120,6 +136,8 @@ func suspend() -> void:
 	stop()
 	if synth != null:
 		synth.set_enabled(false)
+	if sampler != null:
+		sampler.set_enabled(false)
 
 ## Undo suspend(): restart the render thread and re-send the patch, since a
 ## set_patch while disabled is dropped by the engine.
@@ -130,6 +148,8 @@ func resume() -> void:
 	if synth != null:
 		synth.set_enabled(true)
 		synth.set_patch(CHANNEL, get_effective_patch())
+	if sampler != null:
+		sampler.set_enabled(true)
 
 func is_suspended() -> bool:
 	return _suspended
@@ -137,7 +157,7 @@ func is_suspended() -> bool:
 ## Stop everything and free the rig. After this ensure_started() builds a new one.
 func shutdown() -> void:
 	stop()
-	for n in [track, director, synth]:
+	for n in [track, director, synth, sampler]:
 		if n != null and is_instance_valid(n):
 			if n.get_parent() == self:
 				remove_child(n)
@@ -145,6 +165,8 @@ func shutdown() -> void:
 	track = null
 	director = null
 	synth = null
+	sampler = null
+	_held.clear()
 
 func _exit_tree() -> void:
 	if synth != null:
@@ -165,6 +187,9 @@ func set_patch(p: SynthPatch) -> void:
 	if synth != null and not _suspended:
 		synth.set_patch(CHANNEL, get_effective_patch())
 		synth.all_notes_off()
+	if sampler != null:
+		sampler.all_notes_off()
+	_held.clear()
 	patch_changed.emit(p)
 
 ## Choose the MusicData to preview. Null selects the built-in default. A change
@@ -189,6 +214,77 @@ func set_track_type(t: int) -> void:
 func set_base_octave(o: int) -> void:
 	if track != null:
 		track.base_octave = o
+
+# ---------------------------------------------------------------------------
+# Auditioning single notes
+# ---------------------------------------------------------------------------
+
+## The sampler, built on first use. It never preloads the project's sets (the
+## Sound view hands it the one it wants) and is inert unless it is this rig's.
+func ensure_sampler() -> SynthSampler:
+	if sampler != null:
+		return sampler
+	sampler = SynthSampler.new()
+	sampler.name = "PreviewSampler"
+	sampler.editor_preview = true
+	sampler.preload_sets = false
+	add_child(sampler)
+	if _suspended:
+		sampler.set_enabled(false)
+	return sampler
+
+## The baked set a Baked audition plays for the current patch. Null: nothing to play.
+func set_audition_set(s: SynthSampleSet) -> void:
+	audition_set = s
+	if sampler != null:
+		sampler.all_notes_off()
+		_bind_audition_set()
+
+func _bind_audition_set() -> void:
+	var p: SynthPatch = get_effective_patch()
+	sampler.set_patch_sample_set(p, audition_set)
+	sampler.set_patch(CHANNEL, p)
+
+## Start [param note] at [param velocity] on the live engine, or on the sampler
+## with the patch's baked set when [param baked]. Returns which engine took it.
+func audition_note_on(note: int, velocity: float, baked: bool = false) -> StringName:
+	if _suspended:
+		return &"none"
+	ensure_started()
+	var engine: StringName = &"live"
+	if baked:
+		if audition_set == null:
+			engine = &"none"
+		else:
+			ensure_sampler()
+			_bind_audition_set()
+			sampler.note_on(CHANNEL, float(note), velocity)
+			engine = &"baked"
+	else:
+		synth.note_on(CHANNEL, float(note), velocity)
+	if engine != &"none":
+		_held[note] = engine
+	last_audition_engine = engine
+	audition_played.emit(engine, note)
+	return engine
+
+## Release a note started by [method audition_note_on], on whichever engine took it.
+func audition_note_off(note: int) -> void:
+	var engine: StringName = _held.get(note, &"")
+	_held.erase(note)
+	if engine == &"live" and synth != null:
+		synth.note_off(CHANNEL, note)
+	elif engine == &"baked" and sampler != null:
+		sampler.note_off(CHANNEL, note)
+
+## Release every auditioned note that is still held.
+func audition_all_off() -> void:
+	for n in _held.keys():
+		audition_note_off(n)
+
+## Notes of the audition that are still held: midi -> &"live" / &"baked".
+func get_held_auditions() -> Dictionary:
+	return _held.duplicate()
 
 # ---------------------------------------------------------------------------
 # Transport
@@ -223,6 +319,9 @@ func stop() -> void:
 		track.deactivate()
 	if synth != null:
 		synth.all_notes_off()
+	if sampler != null:
+		sampler.all_notes_off()
+	_held.clear()
 	_sync_playing()
 
 func _process(_delta: float) -> void:

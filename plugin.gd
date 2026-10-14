@@ -18,6 +18,8 @@ var _main_screen: Control
 func _enter_tree() -> void:
 	_main_screen = MainScreenScript.new()
 	_main_screen.name = "SynthMainScreen"
+	# The Sound view records its edits here, so Ctrl+Z in the editor undoes them.
+	_main_screen.undo_redo = get_undo_redo()
 	EditorInterface.get_editor_main_screen().add_child(_main_screen)
 	_make_visible(false)
 

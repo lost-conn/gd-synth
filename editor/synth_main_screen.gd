@@ -4,7 +4,7 @@ extends VBoxContainer
 
 # The Synth tab's main screen. A top bar over three views:
 #
-#   Sound    the patch editor (a patch rack, in a later phase)
+#   Sound    the patch rack (browser, module cards, audition keyboard)
 #   Pattern  the pattern editor (piano roll + inspector)
 #   Track    a read-only list of a music scene's MusicTracks (placeholder)
 #
@@ -21,7 +21,7 @@ enum Mode { SOUND, PATTERN, TRACK }
 
 const MODE_NAMES := ["Sound", "Pattern", "Track"]
 const NOTE_NAMES := ["C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"]
-const PatchEditorScript := preload("./patch_editor.gd")
+const PatchRackScript := preload("./synth_patch_rack.gd")
 const PatternEditorScene := preload("./pattern_editor.tscn")
 const TrackViewScript := preload("./synth_track_view.gd")
 const PreviewScript := preload("./synth_preview.gd")
@@ -30,9 +30,16 @@ signal mode_changed(mode: int)
 
 ## The shared preview rig (engine + director + track). Built on first use.
 var preview: SynthPreview
-## Right side of the top bar. Phase 2 fills it with the sample-bake status; see
-## set_bake_status().
+## Right side of the top bar: the sound's sample-bake status, set by the Sound
+## view through set_bake_status().
 var bake_chip: PanelContainer
+## The editor's EditorUndoRedoManager (EditorPlugin.get_undo_redo()), which the
+## Sound view records its edits in. Set it before or after the tab is built.
+var undo_redo: Object:
+	set(v):
+		undo_redo = v
+		if _patch_rack != null:
+			_patch_rack.undo_redo = v
 
 var _mode: int = Mode.SOUND
 var _started: bool = false
@@ -51,8 +58,8 @@ var _bake_label: Label
 var _highlight_block: int = -1
 
 var _content: Control
-var _sound_view: ScrollContainer
-var _patch_editor: PanelContainer
+var _sound_view: Control
+var _patch_rack: SynthPatchRack
 var _pattern_view: ScrollContainer
 var _pattern_editor: PanelContainer
 var _track_view: SynthTrackView
@@ -77,7 +84,7 @@ func _ready() -> void:
 
 	# Start from the preview's patch, so the Sound view is never blank and the
 	# first Play in Pattern has a patch. (No engine yet: the UI only.)
-	_patch_editor.set_patch(preview.get_effective_patch())
+	_patch_rack.set_patch(preview.get_effective_patch())
 	set_mode(Mode.SOUND)
 	_refresh_readout()
 	_apply_icons()
@@ -100,7 +107,9 @@ func set_active(active: bool) -> void:
 	if active:
 		_ensure_started()
 		preview.resume()
+		_patch_rack.rescan()
 	else:
+		_patch_rack.release_keys()
 		preview.suspend()
 
 func set_mode(mode: int) -> void:
@@ -120,8 +129,7 @@ func open_patch(p: SynthPatch) -> void:
 	if p == null:
 		return
 	_ensure_started()
-	_patch_editor.current_path = _saved_path(p)
-	_patch_editor.set_patch(p)
+	_patch_rack.open_patch(p, _saved_path(p))
 	set_mode(Mode.SOUND)
 
 ## Edit [param p] in the Pattern view.
@@ -145,8 +153,13 @@ func set_music_data(d: MusicData) -> void:
 func get_current_patch() -> SynthPatch:
 	return preview.get_effective_patch()
 
+## The Sound view.
+func get_patch_rack() -> SynthPatchRack:
+	return _patch_rack
+
+## Same as get_patch_rack(); the name phase 1 gave it.
 func get_patch_editor() -> Control:
-	return _patch_editor
+	return _patch_rack
 
 func get_pattern_editor() -> Control:
 	return _pattern_editor
@@ -162,7 +175,8 @@ func play() -> void:
 func stop() -> void:
 	preview.stop()
 
-## Phase 2 hook: set the chip at the right of the top bar.
+## Set the chip at the right of the top bar. The Sound view calls this with the
+## patch's bake status; a host may too.
 func set_bake_status(text: String, tooltip: String = "", color: Color = Color(0.7, 0.72, 0.78)) -> void:
 	_bake_label.text = text
 	_bake_label.add_theme_color_override("font_color", color)
@@ -252,7 +266,7 @@ func _build_bar() -> void:
 	_prog_box.add_theme_constant_override("separation", 6)
 	readout.add_child(_prog_box)
 
-	# Bake-status chip, right-aligned. Phase 2 fills it.
+	# Bake-status chip, right-aligned. The Sound view fills it.
 	bake_chip = PanelContainer.new()
 	bake_chip.size_flags_vertical = Control.SIZE_SHRINK_CENTER
 	var sb := StyleBoxFlat.new()
@@ -266,7 +280,7 @@ func _build_bar() -> void:
 	_bake_label = Label.new()
 	bake_chip.add_child(_bake_label)
 	bar.add_child(bake_chip)
-	set_bake_status("Bake: n/a", "Sample-bake status will show here.")
+	set_bake_status("No patch", "The sample-bake status of the patch in the Sound view shows here.")
 
 func _build_views() -> void:
 	_content = Control.new()
@@ -275,17 +289,16 @@ func _build_views() -> void:
 	_content.clip_contents = true
 	add_child(_content)
 
-	# Sound: the patch editor is a fixed-width single column, so it scrolls.
-	_sound_view = ScrollContainer.new()
-	_sound_view.set_anchors_and_offsets_preset(Control.PRESET_FULL_RECT)
-	_sound_view.horizontal_scroll_mode = ScrollContainer.SCROLL_MODE_AUTO
-	_content.add_child(_sound_view)
-	_patch_editor = PatchEditorScript.new()
-	_patch_editor.show_demo_hints = false
-	_patch_editor.custom_minimum_size = Vector2(640, 0)
-	_patch_editor.size_flags_horizontal = Control.SIZE_EXPAND_FILL
-	_patch_editor.patch_changed.connect(_on_patch_editor_changed)
-	_sound_view.add_child(_patch_editor)
+	# Sound: the patch rack lays itself out (cards wrap to the width, the browser
+	# folds away on a narrow tab), so it fills the view and scrolls its own cards.
+	_patch_rack = PatchRackScript.new()
+	_patch_rack.preview = preview
+	_patch_rack.undo_redo = undo_redo
+	_patch_rack.set_anchors_and_offsets_preset(Control.PRESET_FULL_RECT)
+	_patch_rack.patch_changed.connect(_on_patch_editor_changed)
+	_patch_rack.bake_status_changed.connect(set_bake_status)
+	_sound_view = _patch_rack
+	_content.add_child(_patch_rack)
 
 	# Pattern: the editor's toolbars are wider than a docked main screen can be,
 	# so it scrolls instead of dragging the editor window's minimum size up.
@@ -329,7 +342,6 @@ func _ensure_started() -> void:
 		return
 	_started = true
 	preview.ensure_started()
-	_patch_editor.synth = preview.synth
 	_pattern_editor.bind_preview(preview)
 	preview.director.block_changed.connect(_on_block_changed)
 
@@ -337,16 +349,15 @@ func _ensure_started() -> void:
 # Shared state plumbing
 # ---------------------------------------------------------------------------
 
-# Sound changed its patch (preset, New, Load, or opened from the filesystem).
+# Sound changed its patch (preset, New, a browser pick, or opened from the filesystem).
 func _on_patch_editor_changed(p: SynthPatch) -> void:
 	preview.set_patch(p)
 
 # The preview's patch changed from elsewhere (the Pattern view's Load Patch):
 # Sound follows, so it edits what Pattern plays.
 func _on_preview_patch_changed(p: SynthPatch) -> void:
-	if p != null and p != _patch_editor.patch:
-		_patch_editor.current_path = _saved_path(p)
-		_patch_editor.set_patch(p)
+	if p != null and p != _patch_rack.patch:
+		_patch_rack.open_patch(p, _saved_path(p), true)
 
 func _on_data_file_chosen(path: String) -> void:
 	var res := load(path)

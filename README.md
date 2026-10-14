@@ -84,7 +84,7 @@ This means the synth is happily reusable for SFX even without music playing, the
 
 Enable the plugin and a **Synth** tab appears next to 2D / 3D / Script. It is one workspace with three views, switched from the bar at the top:
 
-- **Sound** hosts the patch editor: harmonics, envelope, filter, FM, noise, presets, load/save of `SynthPatch` resources.
+- **Sound** is a patch rack: a browser of every `SynthPatch` in the project plus the factory presets, one card per module (oscillator with a harmonics editor, amp envelope, filter, FM and modulation, pitch drop, noise) with small live pictures, and an audition keyboard (click, or A-K while the view has focus) that plays either the live engine or the patch's baked `SynthSampleSet`. Edits go through the editor's undo history. The bake chip says whether the baked set is up to date; re-baking is left to your project's bake tool, since a set does not record the notes the game plays.
 - **Pattern** hosts the pattern editor: a piano roll (marquee select, copy/paste, bends, a movable playhead) with a note inspector, load/save of `MusicPattern` resources.
 - **Track** lists the `MusicTrack` nodes of a music scene you pick (a `.tscn`): name, type, pattern, patch, channel, octave. Read-only for now.
 
