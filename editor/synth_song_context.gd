@@ -30,11 +30,18 @@ static func read(path: String) -> SynthSongContext:
 	var root := packed.instantiate(PackedScene.GEN_EDIT_STATE_DISABLED)
 	if root == null:
 		return null
+	var ctx := from_root(path, root)
+	root.free()
+	return ctx
+
+## The tracks of the scene whose root is [param root], which may be the live
+## scene open in the editor (unsaved edits included) or a detached instance.
+## [param root] is only read.
+static func from_root(path: String, root: Node) -> SynthSongContext:
 	var ctx := SynthSongContext.new()
 	ctx.scene_path = path
 	ctx._collect(root, root)
 	ctx.music_data = _find_music_data(root)
-	root.free()
 	return ctx
 
 func _collect(node: Node, root: Node) -> void:
@@ -52,6 +59,11 @@ func _collect(node: Node, root: Node) -> void:
 		})
 	for c in node.get_children():
 		_collect(c, root)
+
+## The scene's MusicDataPlayer progression (any node with a music_data property
+## holding a MusicData; it may be a placeholder instance, which still answers get()).
+static func find_music_data(node: Node) -> MusicData:
+	return _find_music_data(node)
 
 static func _find_music_data(node: Node) -> MusicData:
 	var d: Variant = node.get("music_data")

@@ -6,6 +6,10 @@ extends Node
 # ONE MusicTrack, built in code and owned by whoever adds this node (the Synth
 # tab's main screen, or a standalone PatternEditor).
 #
+# A whole song (the Track view's Play) uses the same engine and director with one
+# more MusicTrack per lane, built by play_song(): see "Whole song" below. The
+# single track above stays the Pattern view's.
+#
 # It never touches the game's /root/Synth or /root/Music autoloads: the track is
 # handed its director and synth before it enters the tree and has autoplay off,
 # so MusicTrack._ready does not go looking for the globals.
@@ -55,7 +59,13 @@ var music_data: MusicData
 ## stop. True = loop until stopped.
 var loop: bool = true
 
+## The song's tracks while a whole song is on (play_song), one per lane in the
+## order given. Empty otherwise.
+var song_tracks: Array[MusicTrack] = []
+
 var _suspended: bool = false
+var _song_on: bool = false
+var _song_audible: Array[bool] = []
 # Auditioned notes still held: midi -> the engine that started them.
 var _held: Dictionary = {}
 var _last_playing: bool = false
@@ -157,6 +167,7 @@ func is_suspended() -> bool:
 ## Stop everything and free the rig. After this ensure_started() builds a new one.
 func shutdown() -> void:
 	stop()
+	_free_song_tracks()
 	for n in [track, director, synth, sampler]:
 		if n != null and is_instance_valid(n):
 			if n.get_parent() == self:
@@ -184,7 +195,8 @@ func set_patch(p: SynthPatch) -> void:
 	patch = p
 	if track != null:
 		track.patch = p
-	if synth != null and not _suspended:
+	# While a song plays, channel 0 belongs to whichever lane uses it.
+	if synth != null and not _suspended and not _song_on:
 		synth.set_patch(CHANNEL, get_effective_patch())
 		synth.all_notes_off()
 	if sampler != null:
@@ -202,6 +214,13 @@ func set_music_data(d: MusicData) -> void:
 		director.swap_data(get_effective_music_data(), MusicDirector.SwapMode.IMMEDIATE)
 		_end_beat = -1.0
 	music_data_changed.emit(d)
+
+## The effective MusicData was edited in place (blocks added, removed, reordered).
+## A director that is playing re-derives which block it is in, so it never points
+## past the end of a shortened progression.
+func progression_edited() -> void:
+	if director != null and director.playing:
+		director.seek(director.get_total_beats())
 
 func set_pattern(p: MusicPattern) -> void:
 	if track != null:
@@ -299,6 +318,7 @@ func play_pattern(pattern: MusicPattern, track_type: int, base_octave: int) -> v
 	if _suspended:
 		return
 	ensure_started()
+	_stop_song_tracks()
 	track.track_type = track_type
 	track.pattern = pattern
 	track.patch = get_effective_patch()
@@ -308,15 +328,150 @@ func play_pattern(pattern: MusicPattern, track_type: int, base_octave: int) -> v
 	track.activate()
 	var data: MusicData = get_effective_music_data()
 	director.data = data
-	_end_beat = _one_shot_end_beat(data, pattern)
+	_end_beat = _one_shot_end_beat(data, pattern.length_beats if pattern != null else 0.0)
 	director.play()
 	_sync_playing()
+
+# ---------------------------------------------------------------------------
+# Whole song
+# ---------------------------------------------------------------------------
+
+## Play every lane in [param lanes] together through the current MusicData, each
+## on its own channel with its own patch, from [param start_beat].
+##
+## A lane is a Dictionary: pattern (MusicPattern or null), type (MusicTrack.TrackType),
+## patch (SynthPatch or null: the shared current patch), channel (0..15),
+## base_octave, pan, audible (false = muted: it is built but not activated).
+##
+## The song tracks are the preview's own, like the single one: handed their
+## director and synth before they enter the tree, autoplay off. A lane's
+## swap_mode and sync_to_director are not honoured: every lane starts at once, on
+## the timeline, so that what the lanes draw is what is heard.
+func play_song(lanes: Array, start_beat: float = 0.0) -> void:
+	if _suspended:
+		return
+	ensure_started()
+	stop()
+	_free_song_tracks()
+	_song_on = true
+	_song_audible.clear()
+	var longest := 0.0
+	for spec in lanes:
+		var t := MusicTrack.new()
+		t.name = "SongTrack%d" % song_tracks.size()
+		t.editor_preview = true
+		t.director = director
+		t.synth = synth
+		t.autoplay = false
+		t.track_type = int(spec.get("type", MusicTrack.TrackType.CHORD))
+		t.pattern = spec.get("pattern")
+		t.patch = spec.get("patch") if spec.get("patch") != null else get_effective_patch()
+		t.synth_channel = clampi(int(spec.get("channel", 0)), 0, 15)
+		t.base_octave = int(spec.get("base_octave", 4))
+		t.pan = float(spec.get("pan", 0.0))
+		t.swap_mode = MusicDirector.SwapMode.IMMEDIATE
+		# From the top, a lane starts its pattern the moment it is activated; from
+		# the middle it has to follow the director's position.
+		t.sync_to_director = start_beat > 0.001
+		add_child(t)
+		song_tracks.append(t)
+		_song_audible.append(bool(spec.get("audible", true)))
+		if t.pattern != null:
+			longest = maxf(longest, t.pattern.length_beats)
+	var data: MusicData = get_effective_music_data()
+	director.data = data
+	for i in song_tracks.size():
+		synth.set_patch(song_tracks[i].synth_channel, song_tracks[i].patch)
+		if _song_audible[i]:
+			song_tracks[i].activate()
+	_end_beat = _one_shot_end_beat(data, longest)
+	director.play()
+	if start_beat > 0.001:
+		director.seek(start_beat)
+	_sync_playing()
+
+## True while a whole song is the thing playing.
+func is_song_on() -> bool:
+	return _song_on
+
+## Silence or restore lane [param i] while the song plays (mute / solo).
+## A lane that comes back joins on the timeline, not from its first note.
+func set_song_lane_audible(i: int, audible: bool) -> void:
+	if i < 0 or i >= song_tracks.size() or _song_audible[i] == audible:
+		return
+	_song_audible[i] = audible
+	var t := song_tracks[i]
+	if audible:
+		t.sync_to_director = true
+		t.activate()
+	else:
+		t.deactivate()
+
+## Change lane [param i] to [param spec] (same keys as play_song) without
+## restarting the song: its notes are released and it rejoins on the timeline.
+func update_song_lane(i: int, spec: Dictionary) -> void:
+	if i < 0 or i >= song_tracks.size():
+		return
+	var t := song_tracks[i]
+	t.deactivate()
+	t.track_type = int(spec.get("type", t.track_type))
+	t.pattern = spec.get("pattern")
+	t.patch = spec.get("patch") if spec.get("patch") != null else get_effective_patch()
+	t.synth_channel = clampi(int(spec.get("channel", 0)), 0, 15)
+	t.base_octave = int(spec.get("base_octave", 4))
+	t.pan = float(spec.get("pan", 0.0))
+	_song_audible[i] = bool(spec.get("audible", true))
+	if synth != null and not _suspended:
+		synth.set_patch(t.synth_channel, t.patch)
+	if _song_audible[i]:
+		t.sync_to_director = true
+		t.activate()
+
+func is_song_lane_audible(i: int) -> bool:
+	return i >= 0 and i < _song_audible.size() and _song_audible[i]
+
+## Voices sounding now, per synth channel: {channel: count}. Released voices
+## still ringing out count too; that is what the ear hears.
+func active_voices_by_channel() -> Dictionary:
+	var out := {}
+	if synth == null:
+		return out
+	for v in synth._voices:
+		if v.active:
+			out[v.channel] = out.get(v.channel, 0) + 1
+	return out
+
+func _stop_song_tracks() -> void:
+	for t in song_tracks:
+		if is_instance_valid(t):
+			t.deactivate()
+	if _song_on:
+		_song_on = false
+		if synth != null and not _suspended:
+			synth.set_patch(CHANNEL, get_effective_patch())
+
+func _free_song_tracks() -> void:
+	for t in song_tracks:
+		if is_instance_valid(t):
+			if t.get_parent() == self:
+				remove_child(t)
+			t.free()
+	song_tracks.clear()
+	_song_audible.clear()
 
 func stop() -> void:
 	if director != null:
 		director.stop()
 	if track != null:
 		track.deactivate()
+	for t in song_tracks:
+		if is_instance_valid(t):
+			t.deactivate()
+	if _song_on:
+		_song_on = false
+		# The song may have put another lane's patch on channel 0.
+		if synth != null and not _suspended:
+			synth.set_patch(CHANNEL, get_effective_patch())
 	if synth != null:
 		synth.all_notes_off()
 	if sampler != null:
@@ -339,13 +494,13 @@ func _sync_playing() -> void:
 		_last_playing = now
 		playing_changed.emit(now)
 
-# One pass over the progression, or over however many progressions the pattern
-# needs to complete (a 8-beat pattern over a 4-beat progression takes two).
-static func _one_shot_end_beat(data: MusicData, pattern: MusicPattern) -> float:
+# One pass over the progression, or over however many progressions a pattern of
+# [param pattern_beats] needs to complete (a 8-beat pattern over a 4-beat
+# progression takes two).
+static func _one_shot_end_beat(data: MusicData, pattern_beats: float) -> float:
 	var prog: float = 0.0
 	for b in data.blocks:
 		prog += float(b.duration_beats)
 	if prog <= 0.0:
 		return -1.0
-	var pat: float = pattern.length_beats if pattern != null else 0.0
-	return prog * maxf(1.0, ceilf(pat / prog - 0.0001))
+	return prog * maxf(1.0, ceilf(pattern_beats / prog - 0.0001))

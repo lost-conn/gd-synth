@@ -6,7 +6,8 @@ extends VBoxContainer
 #
 #   Sound    the patch rack (browser, module cards, audition keyboard)
 #   Pattern  the pattern editor (piano roll, velocity lane, inspector)
-#   Track    a read-only list of a music scene's MusicTracks (placeholder)
+#   Track    the song arranger: a music scene's progression and one lane per
+#            MusicTrack, played together
 #
 # Everything the views play goes through ONE SynthPreview owned here: one
 # engine, one director, one track, never the game's /root/Synth or /root/Music.
@@ -46,9 +47,12 @@ var undo_redo: Object:
 			_patch_rack.undo_redo = v
 		if _pattern_view != null:
 			_pattern_view.undo_redo = v
+		if _track_view != null:
+			_track_view.undo_redo = v
 ## The song the Pattern view draws around its pattern: a music scene's tracks.
 ## Chosen in the Track view, or worked out from the MusicTrack that plays the
 ## pattern being edited (then song_context.inferred is true). Null = none.
+## A scene picked in the Track view also lends the preview its MusicData.
 var song_context: SynthSongContext
 
 var _mode: int = Mode.SOUND
@@ -117,6 +121,7 @@ func set_active(active: bool) -> void:
 		_ensure_started()
 		preview.resume()
 		_patch_rack.rescan()
+		_track_view.refresh(true)
 	else:
 		_patch_rack.release_keys()
 		preview.suspend()
@@ -131,6 +136,15 @@ func set_mode(mode: int) -> void:
 	if _mode == Mode.PATTERN:
 		_ensure_started()
 		_pattern_view.focus_roll.call_deferred()
+	if _mode == Mode.TRACK:
+		_ensure_started()
+		# A song context the Pattern view found is the song to arrange.
+		if _track_view.scene_path == "" and song_context != null and song_context.scene_path != "":
+			_track_view.set_scene(song_context.scene_path, false)
+		else:
+			_track_view.refresh(true)
+		_track_view.focus_view.call_deferred()
+	_update_play_tip()
 	mode_changed.emit(_mode)
 
 func get_mode() -> int:
@@ -182,10 +196,14 @@ func get_pattern_editor() -> Control:
 func get_track_view() -> SynthTrackView:
 	return _track_view
 
-## Play the Pattern view's pattern through the shared preview.
+## Play through the shared preview: the whole song in Track, the Pattern view's
+## pattern anywhere else.
 func play() -> void:
 	_ensure_started()
-	_pattern_view.start_preview()
+	if _mode == Mode.TRACK:
+		_track_view.start_song()
+	else:
+		_pattern_view.start_preview()
 
 func stop() -> void:
 	preview.stop()
@@ -193,9 +211,23 @@ func stop() -> void:
 ## Make [param ctx] the song context (null clears it). [param inferred]: it was
 ## found from the pattern, not picked.
 func set_song_context(ctx: SynthSongContext, inferred: bool = false) -> void:
+	var prev := song_context
 	if ctx != null:
 		ctx.inferred = inferred
 	song_context = ctx
+	# The song's own MusicData is what its tracks are played against, so the
+	# preview takes it up first: the Pattern view resolves the other tracks'
+	# pitches against it. A scene that was picked always lends it (when it is new,
+	# or its MusicData changed); one only inferred from a pattern does not
+	# override a MusicData that was chosen.
+	if ctx != null and ctx.music_data != null:
+		var adopt := false
+		if inferred:
+			adopt = preview.music_data == null
+		else:
+			adopt = prev == null or prev.scene_path != ctx.scene_path or prev.music_data != ctx.music_data
+		if adopt:
+			set_music_data(ctx.music_data)
 	_pattern_view.set_song_context(ctx)
 	song_context_changed.emit(ctx)
 
@@ -208,6 +240,12 @@ func use_patch(path: String) -> void:
 		_patch_rack.open_patch(res, path)
 	else:
 		push_warning("[SynthMainScreen] Not a SynthPatch: " + path)
+
+## The editor's open scenes changed (EditorPlugin.scene_changed / scene_closed):
+## the Track view re-checks whether its music scene is open.
+func editor_scenes_changed() -> void:
+	if _track_view != null:
+		_track_view.editor_scenes_changed()
 
 ## Set the chip at the right of the top bar. The Sound view calls this with the
 ## patch's bake status; a host may too.
@@ -252,7 +290,6 @@ func _build_bar() -> void:
 	left.add_child(transport)
 	_play_btn = Button.new()
 	_play_btn.text = "Play"
-	_play_btn.tooltip_text = "Play the Pattern view's pattern through the current patch and MusicData."
 	_play_btn.pressed.connect(play)
 	transport.add_child(_play_btn)
 	_stop_btn = Button.new()
@@ -345,11 +382,15 @@ func _build_views() -> void:
 	_pattern_view.song_context_inferred.connect(func(ctx): set_song_context(ctx, true))
 	_content.add_child(_pattern_view)
 
-	# Track.
+	# Track: lays itself out (the inspector folds away on a narrow tab).
 	_track_view = TrackViewScript.new()
+	_track_view.undo_redo = undo_redo
+	_track_view.index = _patch_rack.index
 	_track_view.set_anchors_and_offsets_preset(Control.PRESET_FULL_RECT)
-	_track_view.music_data_offered.connect(open_music_data)
-	_track_view.scene_changed.connect(_on_track_scene_changed)
+	_track_view.song_context_changed.connect(_on_track_context_changed)
+	_track_view.pattern_requested.connect(_on_track_pattern_requested)
+	_track_view.patch_requested.connect(open_patch)
+	_track_view.music_data_edited.connect(_refresh_readout)
 	_content.add_child(_track_view)
 
 func _build_dialogs() -> void:
@@ -378,6 +419,7 @@ func _ensure_started() -> void:
 	_started = true
 	preview.ensure_started()
 	_pattern_view.bind_preview(preview)
+	_track_view.bind_preview(preview)
 	preview.director.block_changed.connect(_on_block_changed)
 
 # ---------------------------------------------------------------------------
@@ -394,9 +436,25 @@ func _on_preview_patch_changed(p: SynthPatch) -> void:
 	if p != null and p != _patch_rack.patch:
 		_patch_rack.open_patch(p, _saved_path(p), true)
 
-# The Track view picked (or cleared) a music scene: that is the song context.
-func _on_track_scene_changed(path: String) -> void:
-	set_song_context(SynthSongContext.read(path) if path != "" else null, false)
+# The Track view's song changed (a scene was picked or cleared, or its tracks were
+# edited): that is the song context.
+func _on_track_context_changed(ctx: SynthSongContext) -> void:
+	set_song_context(ctx, false)
+
+# A clip was double-clicked in the Track view: edit its pattern, hearing it through
+# the track's own patch, with the scene as the song context.
+func _on_track_pattern_requested(pattern: MusicPattern, patch: SynthPatch) -> void:
+	_ensure_started()
+	var ctx := _track_view.make_context()
+	if ctx != null and (song_context == null or song_context.scene_path != ctx.scene_path or song_context.inferred):
+		set_song_context(ctx, false)
+	if patch != null:
+		var path := _saved_path(patch)
+		if path != "":
+			use_patch(path)
+		else:
+			_patch_rack.open_patch(patch, "")
+	open_pattern(pattern)
 
 func _on_data_file_chosen(path: String) -> void:
 	var res := load(path)
@@ -404,6 +462,14 @@ func _on_data_file_chosen(path: String) -> void:
 		set_music_data(res)
 	else:
 		push_warning("[SynthMainScreen] Not a MusicData: " + path)
+
+func _update_play_tip() -> void:
+	if _play_btn == null:
+		return
+	if _mode == Mode.TRACK:
+		_play_btn.tooltip_text = "Play every track of the song together, from the playhead, through the current MusicData. Mute and solo apply."
+	else:
+		_play_btn.tooltip_text = "Play the Pattern view's pattern through the current patch and MusicData."
 
 func _on_playing_changed(playing: bool) -> void:
 	_stop_btn.disabled = not playing
@@ -472,29 +538,11 @@ static func chord_names(d: MusicData) -> PackedStringArray:
 	if d == null:
 		return out
 	for b in d.blocks:
-		out.append(NOTE_NAMES[b.chord_root % 12] + chord_suffix(b.chord_intervals))
+		out.append(SynthHarmony.chord_name(b))
 	return out
 
 static func scale_name(iv: PackedInt32Array) -> String:
-	var table := [
-		["Major", MusicData.MAJOR], ["Minor", MusicData.MINOR], ["Dorian", MusicData.DORIAN],
-		["Phrygian", MusicData.PHRYGIAN], ["Lydian", MusicData.LYDIAN],
-		["Mixolydian", MusicData.MIXOLYDIAN], ["Penta Major", MusicData.PENTA_MAJOR],
-		["Penta Minor", MusicData.PENTA_MINOR], ["Blues", MusicData.BLUES],
-		["Chromatic", MusicData.CHROMATIC],
-	]
-	for e in table:
-		if iv == e[1]:
-			return e[0]
-	return "(custom scale)"
+	return SynthHarmony.scale_name(iv)
 
 static func chord_suffix(iv: PackedInt32Array) -> String:
-	var table := [
-		["", MusicData.CHORD_MAJ], ["m", MusicData.CHORD_MIN], ["dim", MusicData.CHORD_DIM],
-		["aug", MusicData.CHORD_AUG], ["maj7", MusicData.CHORD_MAJ7], ["m7", MusicData.CHORD_MIN7],
-		["7", MusicData.CHORD_DOM7], ["sus2", MusicData.CHORD_SUS2], ["sus4", MusicData.CHORD_SUS4],
-	]
-	for e in table:
-		if iv == e[1]:
-			return e[0]
-	return "*"
+	return SynthHarmony.chord_suffix(iv)

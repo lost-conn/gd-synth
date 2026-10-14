@@ -21,9 +21,25 @@ func _enter_tree() -> void:
 	# The Sound view records its edits here, so Ctrl+Z in the editor undoes them.
 	_main_screen.undo_redo = get_undo_redo()
 	EditorInterface.get_editor_main_screen().add_child(_main_screen)
+	# The Track view edits the music scene through its open tab: it wants to know
+	# when scenes are opened, switched and closed.
+	scene_changed.connect(_on_scene_changed)
+	scene_closed.connect(_on_scene_closed)
 	_make_visible(false)
 
+func _on_scene_changed(_root: Node) -> void:
+	if _main_screen != null:
+		_main_screen.editor_scenes_changed()
+
+func _on_scene_closed(_path: String) -> void:
+	if _main_screen != null:
+		_main_screen.editor_scenes_changed()
+
 func _exit_tree() -> void:
+	if scene_changed.is_connected(_on_scene_changed):
+		scene_changed.disconnect(_on_scene_changed)
+	if scene_closed.is_connected(_on_scene_closed):
+		scene_closed.disconnect(_on_scene_closed)
 	if _main_screen != null:
 		# Hide first so the preview stops and the engine's thread is released,
 		# then free the whole tab (preview nodes, dialogs and all).
