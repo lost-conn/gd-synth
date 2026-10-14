@@ -13,6 +13,8 @@ extends VBoxContainer
 ## The picked scene's MusicDataPlayer holds MusicData the author may want as the
 ## preview progression; the view offers it, the tab decides.
 signal music_data_offered(data: MusicData)
+## A scene was picked (or cleared, with ""): the tab takes it as the song context.
+signal scene_changed(path: String)
 
 const COLUMNS := ["Track", "Type", "Pattern", "Patch", "Channel", "Octave"]
 const TYPE_NAMES := ["Chord", "Melody", "Drum"]
@@ -99,6 +101,7 @@ func _build_ui() -> void:
 ## Read [param path] and list its MusicTracks. An empty path clears the list.
 func set_scene(path: String) -> void:
 	scene_path = path
+	scene_changed.emit(path)
 	_scene_data = null
 	_use_data_btn.disabled = true
 	_path_label.text = path if path != "" else "(none)"

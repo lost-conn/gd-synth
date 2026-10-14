@@ -73,7 +73,7 @@ This means the synth is happily reusable for SFX even without music playing, the
 |---|---|---|
 | `SynthPatch` | `.tres` | The Synth tab's Sound view. Or the inspector. Or notepad if you're feeling brave. |
 | `MusicPattern` | `.tres` | The Synth tab's Pattern view (piano roll). |
-| `PatternNote` | inline sub-resource | Footer of the pattern editor. |
+| `PatternNote` | inline sub-resource | The Pattern view's inspector. |
 | `MusicBlock` | inline or `.tres` | Inspector. Defines one chord + scale + duration. |
 | `MusicData` | `.tres` | Inspector. A list of MusicBlocks plus BPM. |
 | `SynthSampleSet` | `.res` | Nowhere — `SynthSampleBaker` makes it. A patch, baked to samples. |
@@ -85,8 +85,8 @@ This means the synth is happily reusable for SFX even without music playing, the
 Enable the plugin and a **Synth** tab appears next to 2D / 3D / Script. It is one workspace with three views, switched from the bar at the top:
 
 - **Sound** is a patch rack: a browser of every `SynthPatch` in the project plus the factory presets, one card per module (oscillator with a harmonics editor, amp envelope, filter, FM and modulation, pitch drop, noise) with small live pictures, and an audition keyboard (click, or A-K while the view has focus) that plays either the live engine or the patch's baked `SynthSampleSet`. Edits go through the editor's undo history. The bake chip says whether the baked set is up to date; re-baking is left to your project's bake tool, since a set does not record the notes the game plays.
-- **Pattern** hosts the pattern editor: a piano roll (marquee select, copy/paste, bends, a movable playhead) with a note inspector, load/save of `MusicPattern` resources.
-- **Track** lists the `MusicTrack` nodes of a music scene you pick (a `.tscn`): name, type, pattern, patch, channel, octave. Read-only for now.
+- **Pattern** is a piano roll for a `MusicPattern`. Rows follow the track type (chord tones, scale degrees, or General MIDI drum names) and grow to hold every note; Ctrl+wheel zooms time, Shift or Alt+wheel zooms rows, the wheel scrolls. Click to draw, drag to move or resize, Alt-drag to marquee, arrow keys nudge (Shift+Up/Down an octave), B adds a pitch bend you can then drag by its tip and start. A velocity lane under the roll paints velocities, and the inspector on the right edits every selected note at once. Notes sound as you draw them, and Space plays or stops. The pattern's track type is saved with it (`MusicPattern.editor_track_type`, an editor hint; `MusicTrack.track_type` still decides in the game) and is worked out from the `MusicTrack` that plays the pattern when unset. The header shows the patch that `MusicTrack` pairs with the pattern and offers it in one click; the other tracks of that scene are drawn faintly behind the roll. Every edit goes through the editor's undo history.
+- **Track** lists the `MusicTrack` nodes of a music scene you pick (a `.tscn`): name, type, pattern, patch, channel, octave. Read-only for now. The scene you pick is also the song context the Pattern view draws its other tracks from.
 
 The bar also has a transport (**Play** / **Stop** / **Loop**), a readout of the previewed `MusicData` (BPM, key, and the progression as chord symbols, with the current block lit while playing), and a chip on the right for sample-bake status.
 

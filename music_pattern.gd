@@ -15,6 +15,16 @@ extends Resource
 ## [member PatternNote.beat] position is reached within the loop.
 @export var notes: Array[PatternNote] = []
 
+enum EditorTrackType { AUTO = -1, CHORD = 0, MELODY = 1, DRUM = 2 }
+
+## Editor hint, not read at runtime: which kind of track this pattern is meant
+## for, so the Synth tab's Pattern view can label its rows (chord tones, scale
+## degrees, drum names) without guessing. [member MusicTrack.track_type] stays
+## the authority when the game plays the pattern. AUTO (the default, never
+## written to the file) lets the editor work it out from the MusicTrack that
+## uses the pattern, or from the notes.
+@export var editor_track_type: EditorTrackType = EditorTrackType.AUTO
+
 ## Chainable helper for building patterns in code.
 func add(p_beat: float, p_dur: float, p_index: int, p_oct: int = 0, p_acc: float = 0.0, p_vel: float = 0.8) -> MusicPattern:
 	notes.append(PatternNote.create(p_beat, p_dur, p_index, p_oct, p_acc, p_vel))

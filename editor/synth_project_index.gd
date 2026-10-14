@@ -171,3 +171,24 @@ func has_set_for(patch_path: String) -> bool:
 ## Candidate set files for [param patch_path] (named after the patch file).
 func set_candidates(patch_path: String) -> PackedStringArray:
 	return sets.get(patch_path.get_file().get_basename(), PackedStringArray())
+
+## The scenes (.tscn) whose text mentions the resource at [param res_path], by
+## path or by uid: where to look for the MusicTrack that plays a pattern. Reads
+## the scene files on the spot (only the text, a few hundred KB at most in all),
+## so call it when something is opened, not per frame.
+func scenes_mentioning(res_path: String) -> PackedStringArray:
+	var out := PackedStringArray()
+	if res_path == "":
+		return out
+	var uid := ResourceLoader.get_resource_uid(res_path)
+	var uid_text := ResourceUID.id_to_text(uid) if uid != ResourceUID.INVALID_ID else ""
+	for file in _text_files:
+		if file.get_extension() != "tscn":
+			continue
+		var fa := FileAccess.open(file, FileAccess.READ)
+		if fa == null or fa.get_length() > MAX_TEXT_BYTES:
+			continue
+		var text := fa.get_as_text()
+		if text.contains(res_path) or (uid_text != "" and text.contains(uid_text)):
+			out.append(file)
+	return out

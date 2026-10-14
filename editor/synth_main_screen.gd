@@ -5,7 +5,7 @@ extends VBoxContainer
 # The Synth tab's main screen. A top bar over three views:
 #
 #   Sound    the patch rack (browser, module cards, audition keyboard)
-#   Pattern  the pattern editor (piano roll + inspector)
+#   Pattern  the pattern editor (piano roll, velocity lane, inspector)
 #   Track    a read-only list of a music scene's MusicTracks (placeholder)
 #
 # Everything the views play goes through ONE SynthPreview owned here: one
@@ -22,11 +22,14 @@ enum Mode { SOUND, PATTERN, TRACK }
 const MODE_NAMES := ["Sound", "Pattern", "Track"]
 const NOTE_NAMES := ["C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"]
 const PatchRackScript := preload("./synth_patch_rack.gd")
-const PatternEditorScene := preload("./pattern_editor.tscn")
+const PatternViewScript := preload("./synth_pattern_view.gd")
 const TrackViewScript := preload("./synth_track_view.gd")
 const PreviewScript := preload("./synth_preview.gd")
 
 signal mode_changed(mode: int)
+## The song context changed: the music scene whose other tracks the Pattern view
+## draws faintly (null = none).
+signal song_context_changed(ctx: SynthSongContext)
 
 ## The shared preview rig (engine + director + track). Built on first use.
 var preview: SynthPreview
@@ -34,12 +37,19 @@ var preview: SynthPreview
 ## view through set_bake_status().
 var bake_chip: PanelContainer
 ## The editor's EditorUndoRedoManager (EditorPlugin.get_undo_redo()), which the
-## Sound view records its edits in. Set it before or after the tab is built.
+## Sound and Pattern views record their edits in. Set it before or after the tab
+## is built.
 var undo_redo: Object:
 	set(v):
 		undo_redo = v
 		if _patch_rack != null:
 			_patch_rack.undo_redo = v
+		if _pattern_view != null:
+			_pattern_view.undo_redo = v
+## The song the Pattern view draws around its pattern: a music scene's tracks.
+## Chosen in the Track view, or worked out from the MusicTrack that plays the
+## pattern being edited (then song_context.inferred is true). Null = none.
+var song_context: SynthSongContext
 
 var _mode: int = Mode.SOUND
 var _started: bool = false
@@ -60,8 +70,7 @@ var _highlight_block: int = -1
 var _content: Control
 var _sound_view: Control
 var _patch_rack: SynthPatchRack
-var _pattern_view: ScrollContainer
-var _pattern_editor: PanelContainer
+var _pattern_view: SynthPatternView
 var _track_view: SynthTrackView
 var _data_dialog: FileDialog
 
@@ -119,6 +128,9 @@ func set_mode(mode: int) -> void:
 	_sound_view.visible = _mode == Mode.SOUND
 	_pattern_view.visible = _mode == Mode.PATTERN
 	_track_view.visible = _mode == Mode.TRACK
+	if _mode == Mode.PATTERN:
+		_ensure_started()
+		_pattern_view.focus_roll.call_deferred()
 	mode_changed.emit(_mode)
 
 func get_mode() -> int:
@@ -137,8 +149,7 @@ func open_pattern(p: MusicPattern) -> void:
 	if p == null:
 		return
 	_ensure_started()
-	_pattern_editor.current_path = _saved_path(p)
-	_pattern_editor.set_pattern(p)
+	_pattern_view.open_pattern(p, _saved_path(p))
 	set_mode(Mode.PATTERN)
 
 ## Preview against [param d] (null = the built-in default). Shows the Pattern view.
@@ -161,8 +172,12 @@ func get_patch_rack() -> SynthPatchRack:
 func get_patch_editor() -> Control:
 	return _patch_rack
 
+func get_pattern_view() -> SynthPatternView:
+	return _pattern_view
+
+## Same as get_pattern_view(); the name phase 1 gave it.
 func get_pattern_editor() -> Control:
-	return _pattern_editor
+	return _pattern_view
 
 func get_track_view() -> SynthTrackView:
 	return _track_view
@@ -170,10 +185,29 @@ func get_track_view() -> SynthTrackView:
 ## Play the Pattern view's pattern through the shared preview.
 func play() -> void:
 	_ensure_started()
-	_pattern_editor.start_preview()
+	_pattern_view.start_preview()
 
 func stop() -> void:
 	preview.stop()
+
+## Make [param ctx] the song context (null clears it). [param inferred]: it was
+## found from the pattern, not picked.
+func set_song_context(ctx: SynthSongContext, inferred: bool = false) -> void:
+	if ctx != null:
+		ctx.inferred = inferred
+	song_context = ctx
+	_pattern_view.set_song_context(ctx)
+	song_context_changed.emit(ctx)
+
+## Make the patch file at [param path] the current patch, without leaving the
+## current view. (The Sound view asks first if its patch has unsaved edits.)
+func use_patch(path: String) -> void:
+	var res := ResourceLoader.load(path)
+	if res is SynthPatch:
+		_ensure_started()
+		_patch_rack.open_patch(res, path)
+	else:
+		push_warning("[SynthMainScreen] Not a SynthPatch: " + path)
 
 ## Set the chip at the right of the top bar. The Sound view calls this with the
 ## patch's bake status; a host may too.
@@ -300,21 +334,22 @@ func _build_views() -> void:
 	_sound_view = _patch_rack
 	_content.add_child(_patch_rack)
 
-	# Pattern: the editor's toolbars are wider than a docked main screen can be,
-	# so it scrolls instead of dragging the editor window's minimum size up.
-	_pattern_view = ScrollContainer.new()
+	# Pattern: lays itself out (the header wraps, the inspector folds away on a
+	# narrow tab), so it fills the view.
+	_pattern_view = PatternViewScript.new()
+	_pattern_view.undo_redo = undo_redo
+	_pattern_view.index = _patch_rack.index
 	_pattern_view.set_anchors_and_offsets_preset(Control.PRESET_FULL_RECT)
+	_pattern_view.sound_requested.connect(set_mode.bind(Mode.SOUND))
+	_pattern_view.patch_requested.connect(use_patch)
+	_pattern_view.song_context_inferred.connect(func(ctx): set_song_context(ctx, true))
 	_content.add_child(_pattern_view)
-	_pattern_editor = PatternEditorScene.instantiate()
-	_pattern_editor.custom_minimum_size = Vector2(1000, 460)
-	_pattern_editor.size_flags_horizontal = Control.SIZE_EXPAND_FILL
-	_pattern_editor.size_flags_vertical = Control.SIZE_EXPAND_FILL
-	_pattern_view.add_child(_pattern_editor)
 
 	# Track.
 	_track_view = TrackViewScript.new()
 	_track_view.set_anchors_and_offsets_preset(Control.PRESET_FULL_RECT)
 	_track_view.music_data_offered.connect(open_music_data)
+	_track_view.scene_changed.connect(_on_track_scene_changed)
 	_content.add_child(_track_view)
 
 func _build_dialogs() -> void:
@@ -342,7 +377,7 @@ func _ensure_started() -> void:
 		return
 	_started = true
 	preview.ensure_started()
-	_pattern_editor.bind_preview(preview)
+	_pattern_view.bind_preview(preview)
 	preview.director.block_changed.connect(_on_block_changed)
 
 # ---------------------------------------------------------------------------
@@ -358,6 +393,10 @@ func _on_patch_editor_changed(p: SynthPatch) -> void:
 func _on_preview_patch_changed(p: SynthPatch) -> void:
 	if p != null and p != _patch_rack.patch:
 		_patch_rack.open_patch(p, _saved_path(p), true)
+
+# The Track view picked (or cleared) a music scene: that is the song context.
+func _on_track_scene_changed(path: String) -> void:
+	set_song_context(SynthSongContext.read(path) if path != "" else null, false)
 
 func _on_data_file_chosen(path: String) -> void:
 	var res := load(path)
