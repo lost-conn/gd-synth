@@ -380,6 +380,7 @@ func _build_body() -> void:
 		if i >= 0 and tracks[i].patch != null:
 			patch_requested.emit(tracks[i].patch))
 	_inspector.remove_requested.connect(remove_selected_track)
+	_inspector.match_requested.connect(func(): match_pattern_type(_selected_index()))
 	body.add_child(_inspector)
 
 func _build_drawer(parent: Control) -> void:
@@ -579,7 +580,7 @@ func editor_scenes_changed() -> void:
 func make_context() -> SynthSongContext:
 	if scene_path == "" or _root == null or not is_instance_valid(_root):
 		return null
-	return SynthSongContext.from_root(scene_path, _root)
+	return SynthSongContext.from_root(scene_path, _root, live)
 
 ## Give the keyboard focus to the view (so Space plays at once).
 func focus_view() -> void:
@@ -658,13 +659,7 @@ static func _editor_interface() -> Object:
 	return null
 
 func _find_open_root(path: String) -> Node:
-	var ei := _editor_interface()
-	if ei == null or path == "":
-		return null
-	for r in ei.call("get_open_scene_roots"):
-		if is_instance_valid(r) and (r as Node).scene_file_path == path:
-			return r
-	return null
+	return SynthSongContext.find_open_root(path)
 
 # Decide whether to hold the scene's live nodes or a detached copy. True when the
 # thing being read was swapped for another.
@@ -817,7 +812,7 @@ func _announce_context() -> void:
 		return
 	_ctx_sig = _sig
 	if _root != null and is_instance_valid(_root):
-		song_context_changed.emit(SynthSongContext.from_root(scene_path, _root))
+		song_context_changed.emit(SynthSongContext.from_root(scene_path, _root, live))
 	else:
 		song_context_changed.emit(null)
 
@@ -832,6 +827,7 @@ func _rebuild_lanes() -> void:
 		_lane_box.add_child(lane)
 		var color: Color = SynthPatternView.FAINT_COLORS[i % SynthPatternView.FAINT_COLORS.size()]
 		lane.setup(String(t.name), _lane_sub(t), "%s\n%s" % [_track_path(t), _lane_tip(t)], color)
+		lane.set_warning(SynthSongContext.clash_text(t.pattern, int(t.track_type)))
 		lane.set_gutter(_gutter())
 		lane.clips.timeline = timeline
 		lane.clips.pattern = t.pattern
@@ -922,8 +918,12 @@ func _refresh_inspector() -> void:
 		var info: SynthBakeInfo.Info = _bake_infos.get(SynthSongContext.path_of(t.patch))
 		if info != null:
 			bake = "Bake: %s." % info.chip_text().to_lower().replace("bake ", "")
+	var match_tip := "The scene is not open in the editor, so its tracks are read-only. Use \"Open scene to edit\"."
+	if live and t.pattern != null:
+		match_tip = "Set this track's type to %s, like its pattern (undoable)." % SynthPitchMap.type_name(int(t.pattern.editor_track_type))
 	_inspector.show_track(t, {
 		"editable": live, "path": _track_path(t), "can_remove": can_remove, "remove_tip": tip, "bake": bake,
+		"clash": SynthSongContext.clash_text(t.pattern, int(t.track_type)), "match_tip": match_tip,
 		"banner": "" if live else "Read-only: the scene is not open in the editor. Use \"Open scene to edit\".",
 	})
 
@@ -1193,6 +1193,37 @@ func set_track_property(i: int, prop: StringName, value: Variant, merge: bool = 
 	_edit.set_properties("Set %s" % prop, t, [[t, prop, value]], merge)
 	refresh(true)
 	return true
+
+## Set lane [param i]'s track type to the one its pattern is marked with, as one
+## undo action on the scene (the inspector's Type menu does the same). False if
+## the scene is not open or there is nothing to match.
+func match_pattern_type(i: int) -> bool:
+	if i < 0 or i >= tracks.size() or not SynthSongContext.clash(tracks[i].pattern, int(tracks[i].track_type)):
+		return false
+	return set_track_property(i, &"track_type", int(tracks[i].pattern.editor_track_type))
+
+## Set the type of the tracks named [param names] (paths from the scene's root, as
+## in SynthSongContext.tracks) of the scene at [param scene] to [param type], as one
+## undo action. For the Pattern view, whose tracks may be in any scene. False if
+## that scene is not open in the editor or none of the tracks is there.
+func match_track_types(scene: String, names: Array, type: int) -> bool:
+	var root := _find_open_root(scene)
+	if root == null:
+		return false
+	var changes: Array = []
+	var found := false
+	for n in names:
+		var t := SynthSongContext.node_for(root, String(n)) as MusicTrack
+		if t == null:
+			continue
+		found = true
+		if int(t.track_type) != type:
+			changes.append([t, &"track_type", type])
+	if not changes.is_empty():
+		_edit.set_properties("Set track_type", root, changes)
+		if scene == scene_path:
+			refresh(true)
+	return found
 
 ## Add a MusicTrack to the scene (next to the others), as one undo action.
 func add_track() -> void:

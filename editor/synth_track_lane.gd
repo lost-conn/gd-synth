@@ -22,8 +22,10 @@ var _head: PanelContainer
 var _name: Label
 var _sub: Label
 var _swatch: ColorRect
+var _warn: Label
 var _is_selected: bool = false
 var _gutter_w: float = 0.0
+var _warning: String = ""
 
 func _init() -> void:
 	add_theme_constant_override("separation", 0)
@@ -59,6 +61,13 @@ func _ready() -> void:
 	_sub.add_theme_color_override("font_color", SynthRackStyle.dim(self))
 	_sub.mouse_filter = Control.MOUSE_FILTER_IGNORE
 	col.add_child(_sub)
+	_warn = Label.new()
+	_warn.text = "!"
+	_warn.visible = false
+	_warn.mouse_filter = Control.MOUSE_FILTER_STOP
+	_warn.size_flags_vertical = Control.SIZE_SHRINK_CENTER
+	_warn.add_theme_color_override("font_color", SynthRackStyle.warn(self))
+	row.add_child(_warn)
 	var ms := HBoxContainer.new()
 	ms.add_theme_constant_override("separation", 2)
 	ms.size_flags_vertical = Control.SIZE_SHRINK_CENTER
@@ -67,6 +76,7 @@ func _ready() -> void:
 	solo_btn = _toggle("S", "Solo: only soloed tracks sound.", solo_toggled)
 	ms.add_child(mute_btn)
 	ms.add_child(solo_btn)
+	set_warning(_warning)
 
 	clips = SynthClipLane.new()
 	clips.size_flags_horizontal = Control.SIZE_EXPAND_FILL
@@ -108,6 +118,16 @@ func setup(track_name: String, sub: String, tip: String, color: Color) -> void:
 	_sub.text = sub
 	_head.tooltip_text = tip
 	_swatch.color = color
+
+## Mark the track with a warning ([param text], also its tooltip); "" clears it.
+func set_warning(text: String) -> void:
+	_warning = text
+	if _warn != null:
+		_warn.visible = text != ""
+		_warn.tooltip_text = text
+
+func get_warning_text() -> String:
+	return _warning
 
 ## Width of the name column, in pixels.
 func set_gutter(w: float) -> void:

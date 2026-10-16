@@ -36,6 +36,7 @@ var _bend_box: VBoxContainer
 var _note_spins: Dictionary = {}
 var _bend_spins: Dictionary = {}
 var _info_type: Label
+var _type_warn: Label
 var _info_patch: Label
 var _context_box: VBoxContainer
 var _octave_spin: SpinBox
@@ -95,6 +96,11 @@ func _init() -> void:
 	root.add_child(th)
 	_info_type = _wrapped_label()
 	root.add_child(_info_type)
+	_type_warn = _wrapped_label()
+	_type_warn.add_theme_color_override("font_color", SynthRackStyle.warn(self))
+	_type_warn.mouse_filter = Control.MOUSE_FILTER_STOP
+	_type_warn.visible = false
+	root.add_child(_type_warn)
 	var orow := HBoxContainer.new()
 	orow.add_theme_constant_override("separation", 6)
 	root.add_child(orow)
@@ -191,6 +197,16 @@ func set_type_info(text: String, tooltip: String) -> void:
 	_info_type.text = text
 	_info_type.tooltip_text = tooltip
 	_info_type.mouse_filter = Control.MOUSE_FILTER_STOP
+
+## The warning under the type: a MusicTrack plays the pattern as another type.
+## "" clears it.
+func set_type_warning(text: String) -> void:
+	_type_warn.text = text
+	_type_warn.tooltip_text = text
+	_type_warn.visible = text != ""
+
+func get_type_warning() -> String:
+	return _type_warn.text if _type_warn.visible else ""
 
 func set_patch_info(text: String) -> void:
 	_info_patch.text = text

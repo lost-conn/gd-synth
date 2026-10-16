@@ -13,6 +13,8 @@ signal edited(prop: StringName, value: Variant, merge: bool)
 signal pattern_open_requested
 signal patch_open_requested
 signal remove_requested
+## Set the track's type to the one its pattern is marked with.
+signal match_requested
 
 const TYPE_NAMES := ["Chord", "Melody", "Drum"]
 const SWAP_NAMES := ["Immediate", "Next beat", "Next block"]
@@ -22,6 +24,8 @@ var _title: Label
 var _banner: Label
 var _body: VBoxContainer
 var _type: OptionButton
+var _clash: Label
+var _match: Button
 var _pattern: SynthResourceField
 var _patch: SynthResourceField
 var _open_pattern: Button
@@ -65,6 +69,15 @@ func _init() -> void:
 		_type.add_item(TYPE_NAMES[i], i)
 	_type.item_selected.connect(func(i: int): edited.emit(&"track_type", _type.get_item_id(i), false))
 	_row("Type", _type, TYPE_TIPS)
+	_clash = _wrapped()
+	_clash.add_theme_color_override("font_color", SynthRackStyle.warn(self))
+	_clash.mouse_filter = Control.MOUSE_FILTER_STOP
+	_body.add_child(_clash)
+	_match = Button.new()
+	_match.text = "Match pattern"
+	_match.focus_mode = Control.FOCUS_NONE
+	_match.pressed.connect(func(): match_requested.emit())
+	_body.add_child(_match)
 
 	_pattern = SynthResourceField.new()
 	_pattern.setup("MusicPattern")
@@ -185,7 +198,9 @@ func show_none(message: String) -> void:
 	_body.visible = false
 
 ## Show [param t]. [param info]: editable (bool), bake (String: the patch's bake
-## state), can_remove (bool), remove_tip (String), path (String: the node's path).
+## state), can_remove (bool), remove_tip (String), path (String: the node's path),
+## clash (String: the warning when the pattern is marked with another type, else
+## ""), match_tip (String: the Match pattern button's tooltip).
 func show_track(t: MusicTrack, info: Dictionary) -> void:
 	_editable = info.get("editable", false)
 	_title.text = String(t.name)
@@ -195,6 +210,13 @@ func show_track(t: MusicTrack, info: Dictionary) -> void:
 	_body.visible = true
 	_type.select(_type.get_item_index(int(t.track_type)))
 	_type.disabled = not _editable
+	var clash: String = info.get("clash", "")
+	_clash.text = clash
+	_clash.tooltip_text = clash
+	_clash.visible = clash != ""
+	_match.visible = clash != ""
+	_match.disabled = not _editable
+	_match.tooltip_text = info.get("match_tip", "")
 	_pattern.set_resource(t.pattern)
 	_pattern.editable = _editable
 	_open_pattern.disabled = t.pattern == null
@@ -268,6 +290,12 @@ func get_swap_option() -> OptionButton:
 
 func get_bus_option() -> OptionButton:
 	return _bus
+
+func get_match_button() -> Button:
+	return _match
+
+func get_clash_text() -> String:
+	return _clash.text if _clash.visible else ""
 
 func get_remove_button() -> Button:
 	return _remove

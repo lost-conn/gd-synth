@@ -16,14 +16,23 @@ var scene_path: String = ""
 ## True when the Pattern view worked this scene out from the pattern, rather
 ## than the Track view's user picking it.
 var inferred: bool = false
+## True when the tracks were read from the scene open in the editor, so they can
+## be edited (with undo) and hold its unsaved changes.
+var live: bool = false
 ## The scene's MusicDataPlayer progression, if it has one.
 var music_data: MusicData
 ## One Dictionary per MusicTrack: name, type, pattern, pattern_path, patch,
 ## patch_path, base_octave, channel.
 var tracks: Array = []
 
-## Read [param path]. Null when it is not a scene.
+## Read [param path]: the scene open in the editor if it is, else its file. Null
+## when it is not a scene.
 static func read(path: String) -> SynthSongContext:
+	var open := find_open_root(path)
+	if open != null:
+		return from_root(path, open, true)
+	if not ResourceLoader.exists(path):
+		return null
 	var packed := load(path) as PackedScene
 	if packed == null:
 		return null
@@ -36,10 +45,11 @@ static func read(path: String) -> SynthSongContext:
 
 ## The tracks of the scene whose root is [param root], which may be the live
 ## scene open in the editor (unsaved edits included) or a detached instance.
-## [param root] is only read.
-static func from_root(path: String, root: Node) -> SynthSongContext:
+## [param root] is only read. [param live]: it is the scene open in the editor.
+static func from_root(path: String, root: Node, live: bool = false) -> SynthSongContext:
 	var ctx := SynthSongContext.new()
 	ctx.scene_path = path
+	ctx.live = live
 	ctx._collect(root, root)
 	ctx.music_data = _find_music_data(root)
 	return ctx
@@ -100,3 +110,34 @@ func tracks_for(pattern: MusicPattern) -> Array:
 		if t["pattern"] == pattern or (path != "" and t["pattern_path"] == path):
 			out.append(t)
 	return out
+
+## The root of the scene at [param path] if it is open in the editor, else null.
+static func find_open_root(path: String) -> Node:
+	if path == "" or not Engine.is_editor_hint() or not Engine.has_singleton(&"EditorInterface"):
+		return null
+	for r in Engine.get_singleton(&"EditorInterface").call("get_open_scene_roots"):
+		if is_instance_valid(r) and (r as Node).scene_file_path == path:
+			return r
+	return null
+
+## The track a [code]"name"[/code] of [member tracks] stands for, in the scene
+## whose root is [param root]. Null if there is none.
+static func node_for(root: Node, track_name: String) -> Node:
+	var n := root.get_node_or_null(NodePath(track_name))
+	if n == null and str(root.name) == track_name:
+		return root
+	return n
+
+## True when [param p] is marked with a type of its own and a track of
+## [param track_type] plays it as another (the game goes by the track).
+static func clash(p: MusicPattern, track_type: int) -> bool:
+	return p != null and int(p.editor_track_type) != MusicPattern.EditorTrackType.AUTO \
+			and int(p.editor_track_type) != track_type
+
+## The warning for a [method clash], or "".
+static func clash_text(p: MusicPattern, track_type: int) -> String:
+	if not clash(p, track_type):
+		return ""
+	var as_track := SynthPitchMap.type_name(track_type)
+	return "The pattern is marked %s but this track plays it as %s: the game plays it as %s." % [
+			SynthPitchMap.type_name(int(p.editor_track_type)), as_track, as_track]

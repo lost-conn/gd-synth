@@ -255,6 +255,8 @@ func use_patch(path: String) -> void:
 func editor_scenes_changed() -> void:
 	if _track_view != null:
 		_track_view.editor_scenes_changed()
+	if _pattern_view != null:
+		_pattern_view.refresh_tracks()
 
 ## Set the chip at the right of the top bar. The Sound view calls this with the
 ## patch's bake status; a host may too.
@@ -480,6 +482,7 @@ func _build_views() -> void:
 	_track_view.song_context_changed.connect(_on_track_context_changed)
 	_track_view.pattern_requested.connect(_on_track_pattern_requested)
 	_track_view.patch_requested.connect(open_patch)
+	_pattern_view.match_tracks_requested.connect(_track_view.match_track_types)
 	_track_view.music_data_edited.connect(_refresh_readout)
 	_content.add_child(_track_view)
 

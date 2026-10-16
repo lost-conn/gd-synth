@@ -43,6 +43,10 @@ signal sound_requested
 signal patch_requested(path: String)
 ## The view worked out the song context for the pattern it opened (null: none).
 signal song_context_inferred(ctx: SynthSongContext)
+## Set the type of the MusicTracks named [param names] (paths from the root of
+## [param scene]) to [param type], as one undo action on that scene. The main
+## screen answers it with the Track view's edit path.
+signal match_tracks_requested(scene: String, names: Array, type: int)
 
 const AUTO := MusicPattern.EditorTrackType.AUTO
 const INSPECTOR_WIDTH := 280.0
@@ -69,6 +73,11 @@ var _preview: SynthPreview
 var _preview_is_own: bool = false
 var _addon_dir: String = ""
 var _inferred: Dictionary = {}
+# The song contexts that hold a MusicTrack playing the pattern (what the type is
+# checked against). Filled by a full scan, which an Auto type does not need.
+var _players: Array = []
+var _players_full: bool = false
+var _history_queued: bool = false
 var _offer_path: String = ""
 var _clean_fp: String = ""
 var _last_edited_flag: bool = false
@@ -83,6 +92,7 @@ var _built: bool = false
 var _name_label: Label
 var _path_label: Label
 var _type_opt: OptionButton
+var _match_btn: Button
 var _length_spin: SpinBox
 var _snap_opt: OptionButton
 var _patch_btn: Button
@@ -111,11 +121,16 @@ func _ready() -> void:
 	_build_header()
 	_build_body()
 	_build_dialogs()
+	if undo_redo != null and undo_redo.has_signal(&"history_changed"):
+		undo_redo.connect(&"history_changed", _on_history_changed)
 	_built = true
 	_relayout()
 	_attach(_new_pattern(), "")
 
 func _exit_tree() -> void:
+	if undo_redo != null and is_instance_valid(undo_redo) and undo_redo.has_signal(&"history_changed") \
+			and undo_redo.is_connected(&"history_changed", _on_history_changed):
+		undo_redo.disconnect(&"history_changed", _on_history_changed)
 	_unwatch()
 	if _preview != null and _preview_is_own:
 		_preview.stop()
@@ -163,6 +178,13 @@ func _build_header() -> void:
 	_type_opt.add_item("Drum", 3)
 	_type_opt.item_selected.connect(_on_type_selected)
 	bar.add_child(_type_opt)
+	_match_btn = Button.new()
+	_match_btn.text = "Match pattern"
+	_match_btn.focus_mode = Control.FOCUS_NONE
+	_match_btn.visible = false
+	_match_btn.add_theme_color_override("font_color", SynthRackStyle.warn(self))
+	_match_btn.pressed.connect(_on_match_pressed)
+	bar.add_child(_match_btn)
 
 	bar.add_child(_head_label("Length"))
 	_length_spin = SpinBox.new()
@@ -377,8 +399,11 @@ func set_song_context(ctx: SynthSongContext) -> void:
 	song_context = ctx
 	if not _built or pattern == null:
 		return
+	_note_player(ctx)
 	if changed and int(pattern.editor_track_type) == AUTO:
 		_apply_type(true)
+	elif not _players_full and int(pattern.editor_track_type) != AUTO:
+		_apply_type(false)
 	else:
 		_refresh_faint()
 		_refresh_info()
@@ -412,8 +437,13 @@ func _attach(p: MusicPattern, path: String) -> void:
 # [param infer]: look for the MusicTrack again. [param adopt]: a freshly opened
 # pattern, so take the track's octave and offer its patch.
 func _apply_type(infer: bool, adopt: bool = false) -> void:
+	# An explicit type is checked against every track that plays the pattern, which
+	# takes a full scan the first time it is needed.
+	var explicit := pattern != null and int(pattern.editor_track_type) != AUTO
+	if explicit and not _players_full:
+		infer = true
 	if infer:
-		_inferred = _infer_type()
+		_inferred = _infer_type(explicit or adopt)
 		var track: Dictionary = _inferred.get("track", {})
 		_offer_path = track.get("patch_path", "")
 		if adopt:
@@ -442,8 +472,8 @@ func _data() -> MusicData:
 
 # --- Type inference ----------------------------------------------------------
 
-func _infer_type() -> Dictionary:
-	var found := _find_track()
+func _infer_type(full: bool) -> Dictionary:
+	var found := _find_track(full)
 	if not found.is_empty():
 		var t: Dictionary = found["track"]
 		var ctx: SynthSongContext = found["ctx"]
@@ -480,13 +510,20 @@ func _infer_type() -> Dictionary:
 
 # The MusicTrack that plays the pattern: in the song context first, then in any
 # scene of the project that mentions the pattern's file. {"track", "ctx"} or {}.
-func _find_track() -> Dictionary:
+# [param full]: go on to collect every scene that plays it into _players.
+func _find_track(full: bool) -> Dictionary:
+	_players = []
+	_players_full = full
 	if pattern == null:
 		return {}
+	var found := {}
 	if song_context != null:
 		var t := song_context.track_for(pattern)
 		if not t.is_empty():
-			return {"track": t, "ctx": song_context}
+			found = {"track": t, "ctx": song_context}
+			_players.append(song_context)
+			if not full:
+				return found
 	var keep_context := song_context != null and not song_context.inferred
 	if current_path != "":
 		for scene in _get_index().scenes_mentioning(current_path):
@@ -499,14 +536,18 @@ func _find_track() -> Dictionary:
 			if t2.is_empty():
 				continue
 			ctx.inferred = true
-			if not keep_context:
-				song_context = ctx
-				song_context_inferred.emit(ctx)
-			return {"track": t2, "ctx": ctx}
-	if song_context != null and song_context.inferred:
+			_players.append(ctx)
+			if found.is_empty():
+				found = {"track": t2, "ctx": ctx}
+				if not keep_context:
+					song_context = ctx
+					song_context_inferred.emit(ctx)
+				if not full:
+					return found
+	if found.is_empty() and song_context != null and song_context.inferred:
 		song_context = null
 		song_context_inferred.emit(null)
-	return {}
+	return found
 
 func _get_index() -> SynthProjectIndex:
 	if index == null:
@@ -579,6 +620,7 @@ func _refresh_info() -> void:
 	_inspector.set_type_info("%s%s. %s" % [SynthPitchMap.type_name(type), "" if hint != AUTO else " (auto)", _type_opt.tooltip_text],
 			_type_opt.tooltip_text)
 	_inspector.set_base_octave(base_octave, type != MusicTrack.TrackType.DRUM)
+	_refresh_clash()
 	var track: Dictionary = _inferred.get("track", {})
 	if not track.is_empty() and track["patch_path"] != "":
 		_inspector.set_patch_info("Its MusicTrack plays it with %s on channel %d." % [str(track["patch_path"]).get_file(), track["channel"]])
@@ -600,6 +642,117 @@ func _refresh_info() -> void:
 	_context_btn.disabled = song_context == null
 	_context_btn.tooltip_text = "Draw the other tracks of the song faintly behind this pattern." if song_context != null \
 			else "No song context. Pick a music scene in Track, or open a pattern that a MusicTrack plays."
+
+# --- Tracks that play the pattern as another type ----------------------------
+
+# Every MusicTrack that plays the pattern as a type other than the one the pattern
+# is marked with: [{"ctx", "track"}]. Never any while the type is Auto.
+func _clashes() -> Array:
+	var out: Array = []
+	if pattern == null:
+		return out
+	for c in _players:
+		for t in (c as SynthSongContext).tracks_for(pattern):
+			if SynthSongContext.clash(pattern, int(t["type"])):
+				out.append({"ctx": c, "track": t})
+	return out
+
+func _clash_text(list: Array) -> String:
+	var marked := SynthPitchMap.type_name(int(pattern.editor_track_type))
+	if list.size() == 1:
+		var t: Dictionary = list[0]["track"]
+		var as_track := SynthPitchMap.type_name(int(t["type"]))
+		return "The pattern is marked %s but MusicTrack \"%s\" in %s plays it as %s: the game plays it as %s." % [
+				marked, t["name"], _scene_name(list[0]["ctx"]), as_track, as_track]
+	var lines := PackedStringArray()
+	for e in list:
+		lines.append("%s in %s: %s" % [e["track"]["name"], _scene_name(e["ctx"]), SynthPitchMap.type_name(int(e["track"]["type"]))])
+	return "The pattern is marked %s but the game plays it as the tracks say:\n%s" % [marked, "\n".join(lines)]
+
+static func _scene_name(ctx: SynthSongContext) -> String:
+	return ctx.scene_path.get_file() if ctx.scene_path != "" else "the song context"
+
+# Show the warning (inspector) and the Match pattern button (header), or hide them.
+func _refresh_clash() -> void:
+	var list := _clashes()
+	_match_btn.visible = not list.is_empty()
+	if list.is_empty():
+		_inspector.set_type_warning("")
+		return
+	var text := _clash_text(list)
+	_inspector.set_type_warning(text)
+	var closed := ""
+	for e in list:
+		if not (e["ctx"] as SynthSongContext).live:
+			closed = _scene_name(e["ctx"])
+			break
+	_match_btn.disabled = closed != ""
+	if closed != "":
+		_match_btn.tooltip_text = "%s\n\n%s is not open in the editor, so its tracks are read-only. Open the scene to edit them." % [text, closed]
+	else:
+		_match_btn.tooltip_text = "%s\n\nSet %s to %s (undoable)." % [text,
+				"the track" if list.size() == 1 else "these tracks", SynthPitchMap.type_name(int(pattern.editor_track_type))]
+
+func _on_match_pressed() -> void:
+	if pattern == null or _match_btn.disabled:
+		return
+	var by_scene := {}
+	for e in _clashes():
+		var ctx: SynthSongContext = e["ctx"]
+		if not by_scene.has(ctx.scene_path):
+			by_scene[ctx.scene_path] = []
+		by_scene[ctx.scene_path].append(e["track"]["name"])
+	for scene in by_scene:
+		match_tracks_requested.emit(scene, by_scene[scene], int(pattern.editor_track_type))
+	refresh_tracks()
+
+# A context the Track view announced (or the one found for this pattern) replaces
+# what is held for its scene.
+func _note_player(ctx: SynthSongContext) -> void:
+	if ctx == null:
+		_players_full = false    # which scene went is not known: scan again when it matters
+		return
+	for i in _players.size():
+		if (_players[i] as SynthSongContext).scene_path == ctx.scene_path:
+			if ctx.tracks_for(pattern).is_empty():
+				_players.remove_at(i)
+			else:
+				_players[i] = ctx
+			return
+	if not ctx.tracks_for(pattern).is_empty():
+		_players.append(ctx)
+
+## Read the scenes that play the pattern again: after a track was edited, or a scene
+## was opened or closed in the editor. Only a scene open in the editor can have
+## changed since it was read.
+func refresh_tracks() -> void:
+	if not _built or pattern == null:
+		return
+	var touched := false
+	for i in _players.size():
+		var c: SynthSongContext = _players[i]
+		if not c.live and SynthSongContext.find_open_root(c.scene_path) == null:
+			continue
+		var fresh := SynthSongContext.read(c.scene_path)
+		if fresh == null:
+			continue
+		fresh.inferred = c.inferred
+		if song_context == c:
+			song_context = fresh
+		_players[i] = fresh
+		touched = true
+	if touched:
+		_refresh_info()
+
+func _on_history_changed() -> void:
+	if _history_queued:
+		return
+	_history_queued = true
+	_history_refresh.call_deferred()
+
+func _history_refresh() -> void:
+	_history_queued = false
+	refresh_tracks()
 
 func _refresh_inspector() -> void:
 	if not _built:
