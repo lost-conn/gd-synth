@@ -20,8 +20,10 @@ extends Control
 #   click empty        draw a note (drag sideways to set its length)
 #   drag a note        move it (all selected notes move together)
 #   drag a note's end  resize it
-#   Alt + drag         marquee select (Shift adds)
-#   Shift + click      add to / remove from the selection
+#   Ctrl + drag        marquee select; also Alt + drag (a window manager may
+#                      take Alt for itself). Shift adds to the selection
+#   Shift + drag       marquee that adds to the selection
+#   Shift + click      on a note: add / remove it; on empty: clear the selection
 #   right click        delete the note or bend under the mouse
 #   click a bend       select it; drag its tip (glide + target), or its start
 #                      (offset) once selected
@@ -131,6 +133,9 @@ var _drag_row_delta: int = 0
 var _bend_entry: Dictionary = {}
 var _marquee_anchor: Vector2
 var _marquee_add: bool = false
+## False for a Shift press on empty until the mouse moves past a click's slop:
+## a bare Shift click clears the selection, Shift + drag is a marquee.
+var _marquee_live: bool = true
 var _pan_scroll: Vector2
 var _edit_before: SynthPatternSnapshot
 var _mouse: Vector2 = Vector2(-1, -1)
@@ -444,7 +449,7 @@ func _draw() -> void:
 	_draw_faint()
 	_draw_notes()
 	_draw_bends()
-	if _drag == Drag.MARQUEE:
+	if _drag == Drag.MARQUEE and _marquee_live:
 		var r := Rect2(_marquee_anchor, _mouse - _marquee_anchor).abs()
 		var gold := SynthRackStyle.marker(self)
 		draw_rect(r, Color(gold, 0.15))
@@ -890,20 +895,16 @@ func _press(ev: InputEventMouseButton) -> void:
 		else:
 			_start_move(n, pos)
 		return
-	if ev.alt_pressed:
+	if ev.alt_pressed or ev.ctrl_pressed or ev.meta_pressed or ev.shift_pressed:
 		_drag = Drag.MARQUEE
 		_marquee_anchor = pos
 		_marquee_add = ev.shift_pressed
+		# Shift alone waits to see whether this is a click (clear) or a drag.
+		_marquee_live = ev.alt_pressed or ev.ctrl_pressed or ev.meta_pressed
 		if not _marquee_add and not _selected.is_empty():
 			_selected.clear()
 			selection_changed.emit()
 		queue_redraw()
-		return
-	if ev.shift_pressed:
-		if not _selected.is_empty():
-			_selected.clear()
-			selection_changed.emit()
-			queue_redraw()
 		return
 	_start_create(pos)
 
@@ -921,6 +922,8 @@ func _on_motion(ev: InputEventMouseMotion) -> void:
 			queue_redraw()
 			view_changed.emit()
 		Drag.MARQUEE:
+			if not _marquee_live and pos.distance_to(_marquee_anchor) > 4.0 * _s():
+				_marquee_live = true
 			queue_redraw()
 		Drag.SEEKING:
 			_seek_to(pos)
@@ -977,7 +980,11 @@ func _end_drag() -> void:
 	_bend_entry = {}
 	match d:
 		Drag.MARQUEE:
-			_commit_marquee()
+			if _marquee_live:
+				_commit_marquee()
+			elif not _selected.is_empty():
+				_selected.clear()
+				selection_changed.emit()
 		Drag.CREATING:
 			end_edit("Draw note")
 		Drag.MOVING:

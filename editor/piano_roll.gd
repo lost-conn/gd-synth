@@ -118,6 +118,9 @@ var _drag_start_pos: Vector2
 var _drag_origin: Dictionary = {}
 var _marquee_anchor: Vector2
 var _marquee_add: bool = false
+# False for a Shift press on empty until the mouse moves past a click's slop:
+# a bare Shift click clears the selection, Shift+drag is a marquee.
+var _marquee_live: bool = true
 var _font: Font
 
 func _ready() -> void:
@@ -166,7 +169,7 @@ func _draw() -> void:
 	_draw_bends()
 	_draw_ruler()
 	_draw_gutter()
-	if _drag_state == DragState.MARQUEE:
+	if _drag_state == DragState.MARQUEE and _marquee_live:
 		_draw_marquee()
 	_draw_playhead()
 
@@ -480,14 +483,10 @@ func _handle_button(event: InputEventMouseButton) -> void:
 				else:
 					_start_move(hit, pos)
 			else:
-				if event.alt_pressed:
-					_start_marquee(pos, event.shift_pressed)
-					return
-				if event.shift_pressed:
-					# Shift+empty click: clear selection without creating a note.
-					_selected.clear()
-					selection_changed.emit(_selected)
-					queue_redraw()
+				if event.alt_pressed or event.ctrl_pressed or event.meta_pressed or event.shift_pressed:
+					# Alt/Ctrl/Shift+drag: marquee. A bare Shift click (no drag)
+					# clears the selection without creating a note.
+					_start_marquee(pos, event.shift_pressed, event.alt_pressed or event.ctrl_pressed or event.meta_pressed)
 					return
 				_start_create(pos)
 		else:
@@ -517,6 +516,8 @@ func _handle_motion(event: InputEventMouseMotion) -> void:
 		return
 	var pos: Vector2 = event.position
 	if _drag_state == DragState.MARQUEE:
+		if not _marquee_live and pos.distance_to(_marquee_anchor) > 4.0:
+			_marquee_live = true
 		queue_redraw()
 		return
 	if _drag_state == DragState.SEEKING:
@@ -619,7 +620,11 @@ func _start_resize(note: PatternNote, pos: Vector2) -> void:
 func _end_drag() -> void:
 	match _drag_state:
 		DragState.MARQUEE:
-			_commit_marquee()
+			if _marquee_live:
+				_commit_marquee()
+			elif not _selected.is_empty():
+				_selected.clear()
+				selection_changed.emit(_selected)
 		DragState.CREATING, DragState.MOVING, DragState.RESIZING, DragState.BEND_TIP:
 			pattern_changed.emit()
 	_drag_state = DragState.IDLE
@@ -795,11 +800,12 @@ func _update_seek(pos: Vector2) -> void:
 	director.seek(new_total)
 	queue_redraw()
 
-func _start_marquee(pos: Vector2, add_to_selection: bool) -> void:
+func _start_marquee(pos: Vector2, add_to_selection: bool, live: bool) -> void:
 	_drag_state = DragState.MARQUEE
 	_marquee_anchor = pos
 	_last_mouse_pos = pos
 	_marquee_add = add_to_selection
+	_marquee_live = live
 	if not add_to_selection:
 		_selected.clear()
 		selection_changed.emit(_selected)
