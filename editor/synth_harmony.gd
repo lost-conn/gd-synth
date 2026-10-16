@@ -66,6 +66,50 @@ static func intervals_text(iv: PackedInt32Array) -> String:
 		parts.append(str(v))
 	return ", ".join(parts)
 
+## [param iv] as the set the custom editors author: sorted, without duplicates,
+## always holding 0 (the root), and only offsets within 0..[param max_interval]
+## (anything outside is dropped).
+static func clean_intervals(iv: PackedInt32Array, max_interval: int) -> PackedInt32Array:
+	var seen := {0: true}
+	for v in iv:
+		if v >= 0 and v <= max_interval:
+			seen[v] = true
+	var out := PackedInt32Array()
+	for k in seen:
+		out.append(k)
+	out.sort()
+	return out
+
+## [param iv] with offset [param v] switched on or off, cleaned. The root (0) cannot
+## be switched off.
+static func toggled_intervals(iv: PackedInt32Array, v: int, max_interval: int) -> PackedInt32Array:
+	var out := PackedInt32Array()
+	var had := false
+	for x in iv:
+		if x == v and v != 0:
+			had = true
+		else:
+			out.append(x)
+	if not had:
+		out.append(v)
+	return clean_intervals(out, max_interval)
+
+## Intervals typed as "0, 4, 7, 14" (commas, semicolons or spaces), cleaned. An
+## empty array means the text is not a list of whole numbers in 0..[param max_interval].
+static func parse_intervals(text: String, max_interval: int) -> PackedInt32Array:
+	var parts := text.replace(",", " ").replace(";", " ").split(" ", false)
+	var raw := PackedInt32Array()
+	for p in parts:
+		if not p.is_valid_int():
+			return PackedInt32Array()
+		var v := p.to_int()
+		if v < 0 or v > max_interval:
+			return PackedInt32Array()
+		raw.append(v)
+	if raw.is_empty():
+		return PackedInt32Array()
+	return clean_intervals(raw, max_interval)
+
 ## Total length of the progression in beats.
 static func progression_beats(d: MusicData) -> int:
 	var total := 0

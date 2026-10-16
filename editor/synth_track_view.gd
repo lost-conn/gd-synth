@@ -118,6 +118,13 @@ var _blk_root: OptionButton
 var _blk_quality: OptionButton
 var _blk_sroot: OptionButton
 var _blk_scale: OptionButton
+var _chord_editor: SynthIntervalEditor
+var _scale_editor: SynthIntervalEditor
+# The block whose "Custom..." editor was opened while its intervals still match a
+# preset (so there is nothing in the data to say it is custom yet). Cleared by
+# picking a preset or by selecting another block.
+var _open_chord_custom: MusicBlock
+var _open_scale_custom: MusicBlock
 var _blk_beats: SpinBox
 var _blk_left: Button
 var _blk_right: Button
@@ -379,10 +386,13 @@ func _build_drawer(parent: Control) -> void:
 	var s := _s()
 	_drawer = PanelContainer.new()
 	parent.add_child(_drawer)
+	var rows := VBoxContainer.new()
+	rows.add_theme_constant_override("separation", 4)
+	_drawer.add_child(rows)
 	var flow := HFlowContainer.new()
 	flow.add_theme_constant_override("h_separation", 8)
 	flow.add_theme_constant_override("v_separation", 4)
-	_drawer.add_child(flow)
+	rows.add_child(flow)
 	_drawer_title = Label.new()
 	_drawer_title.add_theme_font_size_override("font_size", 15)
 	_drawer_title.custom_minimum_size.x = 150.0 * s
@@ -396,7 +406,7 @@ func _build_drawer(parent: Control) -> void:
 	flow.add_child(_blk_root)
 	_blk_quality = OptionButton.new()
 	_blk_quality.focus_mode = Control.FOCUS_NONE
-	_blk_quality.tooltip_text = "Chord quality: the chord_intervals a chord track plays. \"Custom\" is shown for intervals that match none of these."
+	_blk_quality.tooltip_text = "Chord quality: the chord_intervals a chord track plays. \"Custom\" is shown for intervals that match none of these; pick it to set the intervals yourself."
 	_blk_quality.item_selected.connect(_on_quality_selected)
 	flow.add_child(_blk_quality)
 	var l_scale := _head_label("Scale")
@@ -407,7 +417,7 @@ func _build_drawer(parent: Control) -> void:
 	flow.add_child(_blk_sroot)
 	_blk_scale = OptionButton.new()
 	_blk_scale.focus_mode = Control.FOCUS_NONE
-	_blk_scale.tooltip_text = "Scale: the scale_intervals a melody track plays."
+	_blk_scale.tooltip_text = "Scale: the scale_intervals a melody track plays. \"Custom\" is shown for intervals that match none of these; pick it to set the intervals yourself."
 	_blk_scale.item_selected.connect(_on_scale_selected)
 	flow.add_child(_blk_scale)
 	var l_beats := _head_label("Beats")
@@ -430,6 +440,15 @@ func _build_drawer(parent: Control) -> void:
 	_blk_remove = _drawer_button("Remove", "Remove this block.", func(): remove_block())
 	flow.add_child(_blk_remove)
 	_drawer_labels = [l_chord, l_scale, l_beats]
+
+	_chord_editor = SynthIntervalEditor.new()
+	_chord_editor.setup("Chord tones", 2, s)
+	_chord_editor.intervals_changed.connect(func(iv: PackedInt32Array): _edit_block("Set chord intervals", &"chord_intervals", iv))
+	rows.add_child(_chord_editor)
+	_scale_editor = SynthIntervalEditor.new()
+	_scale_editor.setup("Scale notes", 1, s)
+	_scale_editor.intervals_changed.connect(func(iv: PackedInt32Array): _edit_block("Set scale intervals", &"scale_intervals", iv))
+	rows.add_child(_scale_editor)
 
 func _drawer_button(text: String, tip: String, cb: Callable) -> Button:
 	var b := Button.new()
@@ -594,7 +613,7 @@ func get_cursor_beat() -> float:
 ## The block editor's widgets, for tests.
 func get_drawer_controls() -> Dictionary:
 	return {"chord_root": _blk_root, "quality": _blk_quality, "scale_root": _blk_sroot, "scale": _blk_scale,
-			"beats": _blk_beats, "left": _blk_left, "right": _blk_right, "add": _blk_add, "remove": _blk_remove,
+			"chord_editor": _chord_editor, "scale_editor": _scale_editor, "beats": _blk_beats, "left": _blk_left, "right": _blk_right, "add": _blk_add, "remove": _blk_remove,
 			"title": _drawer_title}
 
 ## The header's widgets, for tests.
@@ -1300,6 +1319,8 @@ func set_bpm(v: float, merge: bool = false) -> void:
 
 func _select_block(i: int) -> void:
 	_selected_block = i
+	_open_chord_custom = null
+	_open_scale_custom = null
 	_prog_lane.selected = i
 	_sync_drawer()
 
@@ -1320,6 +1341,8 @@ func _sync_drawer() -> void:
 		_drawer_title.text = "Click a chord above to edit it." if d != null and not d.blocks.is_empty() else "No blocks."
 		for c in [_blk_root, _blk_quality, _blk_sroot, _blk_scale, _blk_beats, _blk_left, _blk_right, _blk_remove] + _drawer_labels:
 			c.visible = false
+		_chord_editor.visible = false
+		_scale_editor.visible = false
 		_blk_add.visible = editable
 		_blk_add.disabled = false
 		_blk_add.tooltip_text = "Add a block at the end."
@@ -1335,18 +1358,29 @@ func _sync_drawer() -> void:
 	for e in SynthHarmony.chord_table():
 		_blk_quality.add_item(e[1])
 	var qi := SynthHarmony.chord_index(b.chord_intervals)
-	if qi < 0:
-		_blk_quality.add_item("Custom (%s)" % SynthHarmony.intervals_text(b.chord_intervals))
-		qi = _blk_quality.item_count - 1
-	_blk_quality.select(qi)
+	var chord_custom := qi < 0 or _open_chord_custom == b
+	if not chord_custom:
+		_open_chord_custom = null
+	# The last item is always the custom one: "Custom..." while a preset is set.
+	_blk_quality.add_item("Custom (%s)" % SynthHarmony.intervals_text(b.chord_intervals) if qi < 0 else "Custom...")
+	_blk_quality.select(_blk_quality.item_count - 1 if chord_custom else qi)
 	_blk_scale.clear()
 	for e in SynthHarmony.scale_table():
 		_blk_scale.add_item(e[0])
 	var si := SynthHarmony.scale_index(b.scale_intervals)
-	if si < 0:
-		_blk_scale.add_item("Custom (%s)" % SynthHarmony.intervals_text(b.scale_intervals))
-		si = _blk_scale.item_count - 1
-	_blk_scale.select(si)
+	var scale_custom := si < 0 or _open_scale_custom == b
+	if not scale_custom:
+		_open_scale_custom = null
+	_blk_scale.add_item("Custom (%s)" % SynthHarmony.intervals_text(b.scale_intervals) if si < 0 else "Custom...")
+	_blk_scale.select(_blk_scale.item_count - 1 if scale_custom else si)
+	_chord_editor.visible = chord_custom
+	_chord_editor.set_root(b.chord_root)
+	_chord_editor.set_intervals(b.chord_intervals)
+	_chord_editor.set_editable(editable)
+	_scale_editor.visible = scale_custom
+	_scale_editor.set_root(b.scale_root)
+	_scale_editor.set_intervals(b.scale_intervals)
+	_scale_editor.set_editable(editable)
 	_blk_beats.set_value_no_signal(b.duration_beats)
 	for c in [_blk_root, _blk_quality, _blk_sroot, _blk_scale, _blk_add]:
 		c.disabled = not editable
@@ -1381,19 +1415,29 @@ func set_block_property(i: int, prop: StringName, value: Variant) -> bool:
 	_selected_block = saved
 	return true
 
+# A preset sets the block's intervals; "Custom" changes nothing by itself: it opens
+# the chips and text field, which start from the block's current intervals.
 func _on_quality_selected(i: int) -> void:
 	var table := SynthHarmony.chord_table()
+	var d := _display_data()
+	var b: MusicBlock = d.blocks[_selected_block] if d != null and _selected_block >= 0 and _selected_block < d.blocks.size() else null
+	_open_chord_custom = null
 	if i < table.size():
 		_edit_block("Set chord quality", &"chord_intervals", PackedInt32Array(table[i][2]))
-	else:
-		_sync_drawer()
+	elif b != null and _data_editable():
+		_open_chord_custom = b
+	_sync_drawer()
 
 func _on_scale_selected(i: int) -> void:
 	var table := SynthHarmony.scale_table()
+	var d := _display_data()
+	var b: MusicBlock = d.blocks[_selected_block] if d != null and _selected_block >= 0 and _selected_block < d.blocks.size() else null
+	_open_scale_custom = null
 	if i < table.size():
 		_edit_block("Set scale", &"scale_intervals", PackedInt32Array(table[i][1]))
-	else:
-		_sync_drawer()
+	elif b != null and _data_editable():
+		_open_scale_custom = b
+	_sync_drawer()
 
 func _move_block(dir: int) -> void:
 	var d := _display_data()
