@@ -6,17 +6,24 @@ extends RefCounted
 # the patch as it is now, which notes does it hold. Answers the Sound view's bake
 # chip, the Baked audition and the keyboard's highlighted keys.
 #
-# RE-BAKING. This view cannot re-bake a patch itself, and says so. A set records
-# the patch it was baked from (source_patch, patch_fingerprint) and what came out
-# (roots, velocities, gates, bends), but not what went in: the notes, velocities
-# and note lengths the game plays the patch at, which SynthSampleBaker.Usage
-# holds and which the host's bake tool collects from its songs and SFX tables.
-# Baking again from the roots alone would give a different set from the one the
-# host's tool makes (other note lengths, no softest velocity, no tempo), and
-# would overwrite the host's set with it. So: stale is reported, with the bake
-# tools found in the project (SynthProjectIndex.bake_tools) named in the tooltip.
+# RE-BAKING. This file cannot re-bake a patch from a set alone, and says so. A
+# set records the patch it was baked from (source_patch, patch_fingerprint) and
+# what came out (roots, velocities, gates, bends), but not what went in: the
+# notes, velocities and note lengths the game plays the patch at, which
+# SynthSampleBaker.Usage holds and which the host's bake tool collects from its
+# songs and SFX tables. Baking again from the roots alone would give a different
+# set from the one the host's tool makes (other note lengths, no softest
+# velocity, no tempo), and would overwrite the host's set with it. So: stale is
+# reported, and the Synth tab's Bake button runs the host's own tool, an
+# EditorScript named by the project setting BAKE_TOOL_SETTING. Unset, the
+# tooltip says how to set it and names the bake tools found in the project
+# (SynthProjectIndex.bake_tools).
 
 const SampleBakerScript := preload("../sample_baker.gd")
+
+## Project setting: res:// path of the host's bake EditorScript (its _run() bakes
+## every sample set). Registered by plugin.gd; "" = none.
+const BAKE_TOOL_SETTING := "godot_synth/bake/tool_script"
 
 enum State { NONE, UP_TO_DATE, STALE }
 
@@ -46,9 +53,32 @@ class Info:
 				return SynthRackStyle.warn(c)
 		return SynthRackStyle.dim(c)
 
-## Always false: see the note at the top of this file.
+## Always false: a set alone cannot be re-baked here (see the note at the top of
+## this file); the host's bake tool is what the Bake button runs.
 static func can_rebake(_info: Info) -> bool:
 	return false
+
+## The configured bake tool's path ("" = none set).
+static func bake_tool_path() -> String:
+	if not ProjectSettings.has_setting(BAKE_TOOL_SETTING):
+		return ""
+	return str(ProjectSettings.get_setting(BAKE_TOOL_SETTING, "")).strip_edges()
+
+## Why [param path] cannot be run as the bake tool, "" when it can: it must be a
+## script that extends EditorScript and compiles.
+static func bake_tool_problem(path: String) -> String:
+	if path == "":
+		return "No bake tool is set."
+	if not ResourceLoader.exists(path):
+		return "%s does not exist." % path
+	var script := load(path) as GDScript
+	if script == null:
+		return "%s is not a GDScript." % path
+	if not script.can_instantiate():
+		return "%s does not compile." % path
+	if not ClassDB.is_parent_class(script.get_instance_base_type(), &"EditorScript"):
+		return "%s does not extend EditorScript." % path
+	return ""
 
 ## The chip's hover text.
 static func tooltip(info: Info, bake_tools: PackedStringArray) -> String:
@@ -67,9 +97,14 @@ static func tooltip(info: Info, bake_tools: PackedStringArray) -> String:
 		lines.append("- " + r)
 	if info.state != State.UP_TO_DATE:
 		lines.append("")
-		lines.append("Baking is done by your project's bake tool, not from here: a set does not record the notes the game plays, which the tool collects.")
-		if not bake_tools.is_empty():
-			lines.append("Bake tool script(s) found: " + ", ".join(bake_tools.slice(0, 3)))
+		var tool_path := bake_tool_path()
+		if tool_path != "" and bake_tool_problem(tool_path) == "":
+			lines.append("Press Bake to re-bake every sample set with %s." % tool_path)
+		else:
+			lines.append("Baking is done by your project's bake tool, not from a patch alone: a set does not record the notes the game plays, which the tool collects.")
+			lines.append("Set the tool in Project Settings (%s) to enable the Bake button." % BAKE_TOOL_SETTING)
+			if not bake_tools.is_empty():
+				lines.append("Bake tool script(s) found: " + ", ".join(bake_tools.slice(0, 3)))
 	return "\n".join(lines)
 
 ## Look [param patch] (the patch file at [param patch_path], "" for none) up

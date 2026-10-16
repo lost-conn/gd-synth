@@ -16,6 +16,7 @@ const MainScreenScript := preload("./editor/synth_main_screen.gd")
 var _main_screen: Control
 
 func _enter_tree() -> void:
+	_register_settings()
 	_main_screen = MainScreenScript.new()
 	_main_screen.name = "SynthMainScreen"
 	# The Sound view records its edits here, so Ctrl+Z in the editor undoes them.
@@ -26,6 +27,21 @@ func _enter_tree() -> void:
 	scene_changed.connect(_on_scene_changed)
 	scene_closed.connect(_on_scene_closed)
 	_make_visible(false)
+
+# Project > Project Settings > godot_synth/bake/tool_script: the host's bake
+# EditorScript, which the tab's Bake button runs. Empty by default, so nothing is
+# written to project.godot until a project sets it.
+func _register_settings() -> void:
+	var key := SynthBakeInfo.BAKE_TOOL_SETTING
+	if not ProjectSettings.has_setting(key):
+		ProjectSettings.set_setting(key, "")
+	ProjectSettings.set_initial_value(key, "")
+	ProjectSettings.add_property_info({
+		"name": key,
+		"type": TYPE_STRING,
+		"hint": PROPERTY_HINT_FILE,
+		"hint_string": "*.gd",
+	})
 
 func _on_scene_changed(_root: Node) -> void:
 	if _main_screen != null:

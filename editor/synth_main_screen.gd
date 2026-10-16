@@ -69,6 +69,9 @@ var _key_label: Label
 var _prog_box: HBoxContainer
 var _prog_chips: Array[Label] = []
 var _bake_label: Label
+var _bake_btn: Button
+var _bake_dialog: ConfirmationDialog
+var _baking: bool = false
 var _highlight_block: int = -1
 
 var _content: Control
@@ -94,6 +97,9 @@ func _ready() -> void:
 	add_child(HSeparator.new())
 	_build_views()
 	_build_dialogs()
+	if ProjectSettings.has_signal(&"settings_changed"):
+		ProjectSettings.settings_changed.connect(refresh_bake_button)
+	refresh_bake_button()
 
 	# Start from the preview's patch, so the Sound view is never blank and the
 	# first Play in Pattern has a patch. (No engine yet: the UI only.)
@@ -107,6 +113,8 @@ func _notification(what: int) -> void:
 		_apply_icons()
 
 func _exit_tree() -> void:
+	if ProjectSettings.has_signal(&"settings_changed") and ProjectSettings.settings_changed.is_connected(refresh_bake_button):
+		ProjectSettings.settings_changed.disconnect(refresh_bake_button)
 	if preview != null and is_instance_valid(preview):
 		preview.stop()
 
@@ -118,6 +126,7 @@ func _exit_tree() -> void:
 ## silence the engine's render thread.
 func set_active(active: bool) -> void:
 	if active:
+		refresh_bake_button()
 		_ensure_started()
 		preview.resume()
 		_patch_rack.rescan()
@@ -254,6 +263,80 @@ func set_bake_status(text: String, tooltip: String = "", color: Color = Color(0.
 	_bake_label.add_theme_color_override("font_color", color)
 	bake_chip.tooltip_text = tooltip
 
+## Enable or disable the Bake button for the project's bake tool setting
+## (SynthBakeInfo.BAKE_TOOL_SETTING), and word its tooltip.
+func refresh_bake_button() -> void:
+	if _bake_btn == null:
+		return
+	var path := SynthBakeInfo.bake_tool_path()
+	var problem := SynthBakeInfo.bake_tool_problem(path)
+	_bake_btn.disabled = problem != "" or _baking
+	if problem == "":
+		_bake_btn.tooltip_text = "Bake every sample set with %s. Takes a minute or two; the editor is busy meanwhile." % path
+		return
+	var lines := PackedStringArray([problem])
+	lines.append("Set an EditorScript that bakes your project's sample sets in Project Settings (%s)." % SynthBakeInfo.BAKE_TOOL_SETTING)
+	var tools: PackedStringArray = _patch_rack.index.bake_tools if _patch_rack != null else PackedStringArray()
+	if not tools.is_empty():
+		lines.append("Bake tool script(s) found: " + ", ".join(tools.slice(0, 3)))
+	_bake_btn.tooltip_text = "\n".join(lines)
+
+## Run the project's bake tool (its EditorScript's _run()) once, then refresh the
+## bake chip from the fresh sets. Ignored while a bake is already running. The
+## editor is busy for the length of the bake.
+func run_bake() -> void:
+	if _baking:
+		return
+	var path := SynthBakeInfo.bake_tool_path()
+	var problem := SynthBakeInfo.bake_tool_problem(path)
+	if problem != "":
+		push_error("[SynthMainScreen] Cannot bake: " + problem)
+		set_bake_status("Bake failed", problem, SynthRackStyle.warn(self))
+		return
+	_baking = true
+	refresh_bake_button()
+	set_bake_status("Baking...", "Baking every sample set with %s. The editor is busy until it finishes." % path,
+			SynthRackStyle.accent(self))
+	# Let the chip paint before the editor freezes.
+	await get_tree().process_frame
+	await get_tree().process_frame
+	var tool_script := load(path) as GDScript
+	var bake_tool: Object = tool_script.new() if tool_script != null and tool_script.can_instantiate() else null
+	if bake_tool == null:
+		var msg := "%s could not be instantiated." % path
+		push_error("[SynthMainScreen] " + msg)
+		set_bake_status("Bake failed", msg, SynthRackStyle.warn(self))
+		_baking = false
+		refresh_bake_button()
+		return
+	# The scan the tool (or we) start finishes later: look at the sets again then.
+	var fs := _editor_fs()
+	if fs != null and not fs.is_connected("filesystem_changed", _on_bake_files_changed):
+		fs.connect("filesystem_changed", _on_bake_files_changed, CONNECT_ONE_SHOT)
+	bake_tool.call("_run")
+	if fs != null:
+		fs.call("scan")
+	_baking = false
+	refresh_bake_button()
+	_refresh_after_bake()
+
+func _on_bake_files_changed() -> void:
+	_refresh_after_bake()
+
+# Re-read the sets and re-decide the chip (the bake tool may have rewritten them).
+func _refresh_after_bake() -> void:
+	if _patch_rack == null or _baking:
+		return
+	_patch_rack.rescan()
+	_track_view.refresh(true)
+	if _patch_rack.patch == null:
+		set_bake_status("No patch", "The sample-bake status of the patch in the Sound view shows here.")
+
+static func _editor_fs() -> Object:
+	if Engine.is_editor_hint() and Engine.has_singleton(&"EditorInterface"):
+		return Engine.get_singleton(&"EditorInterface").call("get_resource_filesystem")
+	return null
+
 # ---------------------------------------------------------------------------
 # Construction
 # ---------------------------------------------------------------------------
@@ -337,7 +420,14 @@ func _build_bar() -> void:
 	_prog_box.add_theme_constant_override("separation", 6)
 	readout.add_child(_prog_box)
 
-	# Bake-status chip, right-aligned. The Sound view fills it.
+	# Bake button, then the bake-status chip: right-aligned.
+	_bake_btn = Button.new()
+	_bake_btn.text = "Bake"
+	_bake_btn.size_flags_vertical = Control.SIZE_SHRINK_CENTER
+	_bake_btn.pressed.connect(_on_bake_pressed)
+	bar.add_child(_bake_btn)
+
+	# Bake-status chip. The Sound view fills it.
 	bake_chip = PanelContainer.new()
 	bake_chip.size_flags_vertical = Control.SIZE_SHRINK_CENTER
 	var sb := StyleBoxFlat.new()
@@ -401,6 +491,20 @@ func _build_dialogs() -> void:
 	_data_dialog.size = Vector2i(720, 520)
 	_data_dialog.file_selected.connect(_on_data_file_chosen)
 	add_child(_data_dialog)
+
+	_bake_dialog = ConfirmationDialog.new()
+	_bake_dialog.title = "Bake sample sets"
+	_bake_dialog.ok_button_text = "Bake"
+	_bake_dialog.dialog_autowrap = true
+	_bake_dialog.min_size = Vector2i(Vector2(460, 0) * SynthRackStyle.scale(self))
+	_bake_dialog.confirmed.connect(run_bake)
+	add_child(_bake_dialog)
+
+func _on_bake_pressed() -> void:
+	if _baking:
+		return
+	_bake_dialog.dialog_text = "Bake every sample set with %s?\nTakes a minute or two; the editor is busy meanwhile. Unsaved patch edits are baked as they are in the editor." % SynthBakeInfo.bake_tool_path()
+	_bake_dialog.popup_centered()
 
 # Editor-theme icons when the editor theme is inherited (inside the editor);
 # plain text buttons anywhere else.
