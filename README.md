@@ -78,6 +78,7 @@ This means the synth is happily reusable for SFX even without music playing, the
 | `SynthKit` | inline or `.tres` | The Track view's inspector (a Drum track's pieces). |
 | `MusicBlock` | inline or `.tres` | Inspector. Defines one chord + scale + duration. |
 | `MusicData` | `.tres` | Inspector. A list of MusicBlocks plus BPM. |
+| `MusicSong` | `.tres` | Inspector. A running order of `MusicSection`s (each with `MusicSectionSlot`s) plus BPM. |
 | `SynthSampleSet` | `.res` | Nowhere — `SynthSampleBaker` makes it. A patch, baked to samples. |
 
 ## Chaining patterns: `PatternChain`
@@ -127,6 +128,54 @@ A piece has a `note` (the pattern row, a MIDI note number, that triggers it), a 
 4. Put the merged pattern on the kit track, then delete the old tracks, or leave them in the scene with `autoplay` off while you compare.
 5. Check the kit's channel range against the other tracks (the Track view warns on overlap), then re-bake: the sample sets are named after the patches, which did not change.
 
+## Sections and songs: `MusicSection`, `MusicSong`
+
+MusicTracks are the instruments; a song says what they play when. A `MusicSong` is a running order of sections, and a `MusicDataPlayer` whose `song` is set plays it instead of its `music_data` (a scene with only `music_data` behaves exactly as before).
+
+```gdscript
+var verse := MusicSection.create("verse", verse_chords, 2)          # its own progression, twice
+verse.add_slot(&"Lead", MusicSectionSlot.Mode.PLAY, verse_riff)
+verse.add_slot(&"Drums", MusicSectionSlot.Mode.PLAY, groove)
+var chorus := MusicSection.create("chorus")                        # the song's progression
+chorus.add_slot(&"Lead", MusicSectionSlot.Mode.PLAY, hook)
+chorus.add_slot(&"Pad", MusicSectionSlot.Mode.SILENT)
+var song := MusicSong.new()
+song.bpm = 112.0
+song.progression = main_chords
+song.add_entry(intro).add_entry(verse).add_entry(chorus, 2).add_entry(verse).add_entry(chorus)
+song.loop_entry = 1                                                # after the end, back to the first verse
+$MainMusic.song = song
+```
+
+**The resources.** A `MusicSection` has a `name`, an optional `progression` (a `MusicData`; null uses the song's `progression`), `repeats`, and `slots`. Its length is the progression's beats × `repeats`, so it always ends on a progression boundary; a section with no progression at all has no length and is skipped. A `MusicSong` has the `bpm`, `beats_per_bar` (for `NEXT_BAR` and the editor), the default `progression`, `entries` (`MusicSongEntry`: a section and how many times in a row it plays), `loop_entry`, and `also_bake`. **Tempo comes from the song only:** the bpm of a section's MusicData is ignored. Helpers for tools: `get_length_beats()`, `entry_start(i)`, `entry_at_beat(beat)` (entry, section, repeat and start beat of any beat on the timeline; past the end it folds into the loop), `section_by_name()`, `get_reachable_sections()`.
+
+**Slots.** A slot names a MusicTrack (its node name) and says what it does when the section starts:
+
+- `PLAY` plays the slot's `pattern` (null: the track's own `pattern` from the scene) from its beat 0 on the section's first beat. It restarts there even when the track was already playing the same pattern, so a chain starts at step 1. An inactive track is activated.
+- `SILENT` stops the track; its sounding notes are released.
+- `KEEP` leaves the track alone: it carries on with whatever it was playing, or stays silent, without restarting.
+- **A track the section does not list behaves as `KEEP`.**
+
+Each repeat of an entry is a new start of its section (PLAY slots restart, `section_changed` fires); a section's own `repeats` are not, they only make it longer. Tracks are looked up among the player's descendants, then among the tracks wired to the director (`MusicDirector.get_tracks()`).
+
+**Timing.** The director keeps one beat clock (while the song plays from the top, its beat is the song's timeline beat; after a loop it keeps counting). Section starts are sums of section lengths, never accumulated frame time, so nothing drifts however long the song runs. At a boundary the player swaps the director's progression (`MusicDirector.set_data_at`), so a note on a section's first beat already resolves against its first block; notes due just before the boundary inside the same frame are played first against the old harmony (`MusicTrack.flush_to`). Tracks the song drives start exactly on the beat, whatever their `swap_mode` / `sync_to_director`. Swing applies as usual.
+
+**The loop point.** After the last entry the song continues at `loop_entry` (`song_looped`, then `section_changed`). KEEP tracks carry on into it from wherever they were.
+
+**Controlling it** (for game code, and for the editor's section preview):
+
+- `play()` starts the song at its first entry; `stop()` stops it and gives the tracks back the pattern and active state they had before the song.
+- `play_from_section(index_or_name)` starts at an entry, with every track set as a first pass through the song would have it there (its last PLAY or SILENT before that point, else its own pattern as if it had played from beat 0). `seek(beat)` does the same for any beat of the timeline, and a `MusicDirector.seek()` while a song plays goes through it.
+- `set_loop_section(index_or_name)` plays one section again and again from the next boundary (each pass restarts its PLAY slots); `set_loop_section(-1)` resumes the song order at the next boundary, with the entry after the looped one.
+- `queue_section(name_or_section, mode)` plays any section once, including one only listed in `also_bake`, taking over at `NEXT_SECTION`, `NEXT_BAR`, `NEXT_BLOCK` (the next chord change) or `NEXT_BEAT`. It plays its full length, and then **the song continues with the entry after the one it interrupted** (that entry's remaining repeats are dropped). A set loop section still wins after it.
+- Signals: `section_changed(section, entry_index)` (entry -1 for a queued or looped section no entry plays) and `song_looped`. Getters: `get_current_section()`, `get_current_entry()`, `get_section_start_beat()`, `get_section_length()`.
+
+One song player drives a director at a time. While it does, use its API rather than `MusicDirector.swap_data()`; `swap()` hands the director back to plain `music_data` playback.
+
+**Baking.** `SynthBaker.collect_song()` returns the player's `song` alongside `data`, and its `TrackInfo`s carry the track names. `SynthSampleBaker.add_song_usage_routed()` collects every section the song can reach plus `also_bake` (sections only the game queues: list them there, or they are not baked): a PLAY slot's pattern over that section's progression with the track's type, octave and kit routing at the song's bpm; for a KEEP or unlisted track, its own pattern and every pattern a PLAY slot gives it anywhere, resolved against every block of the section (conservative: it only costs bake size); nothing for SILENT. `SynthBaker.bake_music_song()` renders the song from the top through one pass of the entries as a WAV that plays the intro once and loops from `loop_entry` (queued sections are not in it; a KEEP track whose pattern is elsewhere at the end than at the loop entry jumps there). The host's `bake_samples_job.gd` and `tools/bake_bgm.gd` take the song path when the player has a song.
+
+**In the editor.** Full song editing comes with the timeline (next card). For now the Synth tab shows a song-driven scene over the song's progression (or its first section's).
+
 ## Editor tools
 
 ### The Synth tab
@@ -163,7 +212,7 @@ If you only want the synth (no chord progression, no patterns, just trigger-a-so
 
 Rendering every voice in GDScript is the expensive way to make a sound. Two ways out, both built on `SynthEngine`'s offline renderer (same DSP, no audio thread):
 
-- **`SynthBaker`** flattens a whole song, or one SFX pattern, to a single `AudioStreamWAV`. Costs nothing to play; no longer follows the chord progression, because it is a recording of one.
+- **`SynthBaker`** flattens a whole song (a `MusicData` progression, or a `MusicSong` with `bake_music_song()`), or one SFX pattern, to a single `AudioStreamWAV`. Costs nothing to play; no longer follows the chord progression, because it is a recording of one.
 - **`SynthSampleBaker`** turns a `SynthPatch` into a `SynthSampleSet`: single notes, recorded at the pitches, velocities and lengths your patterns actually play them. `SynthSampler` (below) pitches and mixes those through Godot's mixer while the director and tracks keep sequencing as before. `sample_set.gd` spells out what a sampler has to do; `sample_baker.gd` explains how the notes are recorded (why noise is rendered at the live rate, where loops go, why a decaying note is recorded with its note-off).
 
 ```gdscript

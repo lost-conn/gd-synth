@@ -240,6 +240,62 @@ static func add_track_usage_routed(info, data: MusicData, swing: float, usage_fo
 			_add_bend_usage(usage, pitch, note.bends, MusicTrack.TrackType.DRUM, info.base_octave, null,
 					float(piece.get_pitch() - piece.note))
 
+## Every note [param tracks] ([SynthBaker.TrackInfo]s with names, as
+## [method SynthBaker.collect_song] makes them) can play in [param song], routed
+## per patch as [method add_track_usage_routed] does (kit tracks included). Walks
+## every section the song can reach ([method MusicSong.get_reachable_sections]:
+## the entries' and [member MusicSong.also_bake]'s), each over its own
+## progression at the song's bpm:
+##   - a PLAY slot's pattern (null: the track's own) is resolved block by block,
+##     as it starts on the section's first beat;
+##   - a KEEP or unlisted track may be playing its own pattern or any pattern a
+##     PLAY slot gives it anywhere in the song, from any point: each of those
+##     patterns' notes is resolved against every block of the section's
+##     progression (conservative: a usage only gains notes);
+##   - a SILENT track adds nothing.
+static func add_song_usage_routed(song: MusicSong, tracks: Array, swing: float, usage_for: Callable) -> void:
+	if song == null:
+		return
+	var bpm: float = song.bpm if song.bpm > 0.0 else 120.0
+	var sections: Array[MusicSection] = song.get_reachable_sections()
+	for info in tracks:
+		if info == null:
+			continue
+		var kit: SynthKit = _kit_of(info)
+		if kit == null and info.patch == null:
+			continue
+		# Everything this track may be carrying into a section that keeps it.
+		var carried: Array = []
+		if info.pattern != null:
+			carried.append(info.pattern)
+		for sec in sections:
+			var slot: MusicSectionSlot = sec.get_slot(info.name)
+			if slot != null and slot.mode == MusicSectionSlot.Mode.PLAY:
+				var p: MusicPattern = slot.pattern if slot.pattern != null else info.pattern
+				if p != null and not carried.has(p):
+					carried.append(p)
+		for sec in sections:
+			var prog: MusicData = sec.get_progression(song)
+			if prog == null:
+				continue
+			var slot: MusicSectionSlot = sec.get_slot(info.name)
+			if slot != null and slot.mode == MusicSectionSlot.Mode.SILENT:
+				continue
+			if slot != null and slot.mode == MusicSectionSlot.Mode.PLAY:
+				var p: MusicPattern = slot.pattern if slot.pattern != null else info.pattern
+				if p == null:
+					continue
+				var data := MusicData.new()
+				data.bpm = bpm
+				data.blocks = prog.blocks
+				add_track_usage_routed(info.with_pattern(p), data, swing, usage_for)
+				continue
+			for p in carried:
+				if kit != null:
+					add_kit_pattern_usage(p, kit, bpm, usage_for)
+				else:
+					add_pattern_usage(usage_for.call(info.patch), p, info.track_type, info.base_octave, prog.blocks, bpm)
+
 # The kit a track info plays, or null (not a DRUM track, or no kit).
 static func _kit_of(info) -> SynthKit:
 	var kit: Variant = info.get("kit")

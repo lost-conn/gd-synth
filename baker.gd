@@ -19,9 +19,13 @@ extends RefCounted
 # 22050.0) to reproduce a bake from before gain staging existed.
 #
 # Typical use (editor or headless):
-#   var song := SynthBaker.collect_song(main_music_node)   # {data, tracks, swing}
+#   var song := SynthBaker.collect_song(main_music_node)   # {data, song, tracks, swing}
 #   var wav := SynthBaker.bake_song(song.data, song.tracks, song.swing)
 #   ResourceSaver.save(wav, "res://resources/audio/baked/bgm/main.wav")
+#
+# A scene whose MusicDataPlayer plays a MusicSong (song != null) is rendered with
+# bake_music_song() instead: intro + one pass of the loop region, looping back to
+# the loop entry.
 
 const _TICKS := 480  # subdivisions per beat for exact loop-length LCM
 
@@ -48,23 +52,44 @@ class TrackInfo:
 	var channel: int = 0
 	var base_octave: int = 4
 	var pan: float = 0.0
+	## The MusicTrack's node name: what a [MusicSectionSlot] names it by.
+	var name: StringName = &""
+
+	## A copy of this info, playing [param p_pattern].
+	func with_pattern(p_pattern: MusicPattern) -> TrackInfo:
+		var c := TrackInfo.new()
+		c.pattern = p_pattern
+		c.patch = patch
+		c.kit = kit
+		c.track_type = track_type
+		c.channel = channel
+		c.base_octave = base_octave
+		c.pan = pan
+		c.name = name
+		return c
 
 # ---------------------------------------------------------------------------
 # Scene collection
 # ---------------------------------------------------------------------------
 
 ## Walk [param root] (e.g. an instanced main_music scene) for a
-## MusicDataPlayer's MusicData and every MusicTrack child, returning
-## {data: MusicData, tracks: Array[TrackInfo], swing: float}. Reads exported
+## MusicDataPlayer's MusicData (and MusicSong) and every MusicTrack child,
+## returning {data: MusicData, song: MusicSong, tracks: Array[TrackInfo], swing:
+## float}. song is null unless the player has one, and then it is what plays
+## (data is still the player's music_data, usually null). Reads exported
 ## properties directly — no _ready / tree membership required.
 static func collect_song(root: Node, swing: float = 0.0) -> Dictionary:
 	var data: MusicData = null
+	var song: MusicSong = null
+	var found_player: bool = false
 	var tracks: Array = []
 	var stack: Array = [root]
 	while not stack.is_empty():
 		var n: Node = stack.pop_back()
-		if n is MusicDataPlayer and data == null:
+		if n is MusicDataPlayer and not found_player and (data == null):
+			found_player = (n as MusicDataPlayer).music_data != null or (n as MusicDataPlayer).song != null
 			data = (n as MusicDataPlayer).music_data
+			song = (n as MusicDataPlayer).song
 		elif n is MusicTrack:
 			var t := n as MusicTrack
 			var info := TrackInfo.new()
@@ -75,10 +100,11 @@ static func collect_song(root: Node, swing: float = 0.0) -> Dictionary:
 			info.channel = t.synth_channel
 			info.base_octave = t.base_octave
 			info.pan = t.pan
+			info.name = t.name
 			tracks.append(info)
 		for c in n.get_children():
 			stack.push_back(c)
-	return {"data": data, "tracks": tracks, "swing": swing}
+	return {"data": data, "song": song, "tracks": tracks, "swing": swing}
 
 # ---------------------------------------------------------------------------
 # Baking
@@ -120,6 +146,130 @@ static func bake_song(data: MusicData, tracks: Array, swing: float = 0.0,
 	last_stats = synth.last_offline_stats
 	synth.free()
 	return wav
+
+## Render a [MusicSong] the way [MusicDataPlayer] plays it from the top: every
+## entry once in order (each section over its own progression, at the song's
+## bpm, with PLAY restarting a track's pattern on the section's first beat,
+## SILENT stopping it and KEEP / unlisted tracks carrying on), as one looping
+## AudioStreamWAV that plays the intro once and then loops from
+## [member MusicSong.loop_entry] to the end ([member AudioStreamWAV.loop_begin]).
+## The loop region is rendered as the first pass plays it, so a KEEP track whose
+## pattern is at another point at the end than at the loop entry jumps there.
+## [param tracks] are [TrackInfo]s with names (see [method collect_song]); a
+## track's own pattern plays until a section says otherwise. A note that is
+## still sounding when its track is restarted or silenced is cut there, as live.
+## Queued / [member MusicSong.also_bake] sections are not rendered.
+static func bake_music_song(song: MusicSong, tracks: Array, swing: float = 0.0,
+		mix_rate: float = DEFAULT_MIX_RATE, wrap_seconds: float = 1.0,
+		seed: int = 1234, gain_mode: int = SynthEngine.OfflineGain.LIMIT_PEAK) -> AudioStreamWAV:
+	last_stats = {}
+	if song == null or song.get_length_beats() <= 0.0:
+		push_warning("[SynthBaker] No MusicSong / the song has no length.")
+		return null
+	var bpm: float = song.bpm if song.bpm > 0.0 else 120.0
+	var spb: float = 60.0 / bpm
+	var events: Array = song_events(song, tracks, swing, spb)
+	var patches: Array = []
+	patches.resize(16)
+	for info in tracks:
+		if info == null:
+			continue
+		if info.kit != null and info.track_type == MusicTrack.TrackType.DRUM:
+			for i in info.kit.pieces.size():
+				var ch: int = info.channel + i
+				if ch >= 0 and ch < 16 and info.kit.pieces[i] != null:
+					patches[ch] = info.kit.pieces[i].patch
+		elif info.channel >= 0 and info.channel < 16:
+			patches[info.channel] = info.patch
+	var synth := SynthEngine.new()
+	synth.offline_gain_mode = gain_mode
+	var wav := synth.render_intro_loop_offline(events, patches, song.get_length_beats() * spb,
+			song.get_loop_start_beats() * spb, wrap_seconds, mix_rate, seed)
+	last_stats = synth.last_offline_stats
+	synth.free()
+	return wav
+
+## The events [method bake_music_song] renders: one pass through [param song]'s
+## entries, in seconds at [param spb] seconds per beat.
+static func song_events(song: MusicSong, tracks: Array, swing: float, spb: float) -> Array:
+	# The section instances of one pass: [section, start beat, length].
+	var instances: Array = []
+	for i in song.entries.size():
+		var e: MusicSongEntry = song.entries[i]
+		var slen: float = song.entry_length(i) / float(maxi(1, e.repeats)) if e != null else 0.0
+		if slen <= 0.0:
+			continue
+		var start: float = song.entry_start(i)
+		for r in e.repeats:
+			instances.append([e.section, start + float(r) * slen, slen])
+	var loop_index: int = 0
+	var loop_start: float = song.get_loop_start_beats()
+	for k in instances.size():
+		if instances[k][1] >= loop_start - 1e-6:
+			loop_index = k
+			break
+	var events: Array = []
+	for info in tracks:
+		if info == null:
+			continue
+		var cur: MusicPattern = info.pattern
+		var origin: float = 0.0
+		var on: bool = true
+		for k in instances.size():
+			var section: MusicSection = instances[k][0]
+			var start: float = instances[k][1]
+			var end: float = start + float(instances[k][2])
+			var slot: MusicSectionSlot = section.get_slot(info.name)
+			if slot != null and slot.mode == MusicSectionSlot.Mode.PLAY:
+				cur = slot.pattern if slot.pattern != null else info.pattern
+				origin = start
+				on = true
+			elif slot != null and slot.mode == MusicSectionSlot.Mode.SILENT:
+				on = false
+			if not on or cur == null or cur.get_play_length() <= 0.0:
+				continue
+			# Sounding notes are cut where the next section (or, at the end, the
+			# loop entry) restarts or silences the track.
+			var next_k: int = k + 1 if k + 1 < instances.size() else loop_index
+			var next_slot: MusicSectionSlot = (instances[next_k][0] as MusicSection).get_slot(info.name)
+			var cut: float = end if next_slot != null and next_slot.mode != MusicSectionSlot.Mode.KEEP else INF
+			var span: Array = []
+			_flatten_span(span, info.with_pattern(cur), section.get_progression(song), origin, start, end, swing, spb)
+			if cut < INF:
+				for ev in span:
+					if int(ev[1]) == SynthEngine.CMD_NOTE_OFF and float(ev[0]) > cut * spb:
+						ev[0] = cut * spb
+			events.append_array(span)
+	return events
+
+# Emit one track's notes that fire in [start, end), its pattern looping from
+# [param origin], resolved against [param data] whose first block starts on
+# [param start] (the section's progression).
+static func _flatten_span(events: Array, info: TrackInfo, data: MusicData, origin: float,
+		start: float, end: float, swing: float, spb: float) -> void:
+	var length: float = info.pattern.get_play_length()
+	var kit: SynthKit = info.kit if info.track_type == MusicTrack.TrackType.DRUM else null
+	var first_rep: int = int(floorf((start - origin) / length)) - 1
+	var last_rep: int = int(ceilf((end - origin) / length))
+	for rep in range(first_rep, last_rep + 1):
+		var base_beat: float = origin + float(rep) * length
+		for note in info.pattern.get_play_notes():
+			var fire_beat: float = base_beat + fposmod(_swung(note.beat, swing), length)
+			if fire_beat < start - 1e-6 or fire_beat >= end - 1e-6:
+				continue
+			var block := _block_at(data, fire_beat - start)
+			if kit != null:
+				_flatten_kit_note(events, info, kit, note, block, fire_beat, spb)
+				continue
+			var midi: float = _resolve(info.track_type, block, info.base_octave,
+				note.index, note.octave, note.accidental)
+			var handle: int = roundi(midi)
+			events.append([fire_beat * spb, SynthEngine.CMD_NOTE_ON,
+				info.channel, midi, note.velocity, info.pan])
+			events.append([(fire_beat + note.duration) * spb, SynthEngine.CMD_NOTE_OFF,
+				info.channel, handle])
+			if not note.bends.is_empty():
+				_flatten_bends(events, info, block, handle, note.bends, fire_beat, 0.0, spb)
 
 ## Bake a single pattern+patch to a one-shot (or looping) AudioStreamWAV — the
 ## SFX bake path. CHORD/MELODY pitches resolve against [param block] (pass a

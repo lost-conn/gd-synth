@@ -143,6 +143,8 @@ var _activated_at_beat: float = 0.0
 # bpm_override > 0.
 var _local_time: float = 0.0
 var _prev_cursor: float = -0.001
+# The effective beat the pattern was last scanned up to (see flush_to()).
+var _scanned_to: float = -INF
 # Each entry: {"midi": int, "channel": int, "off_time": float} (off_time in
 # effective beats)
 var _active_notes: Array = []
@@ -193,6 +195,12 @@ func _wire_signals() -> void:
 		director.block_changed.connect(_on_block_changed)
 	if not director.seeked.is_connected(_on_seeked):
 		director.seeked.connect(_on_seeked)
+	if director.has_method("register_track"):
+		director.register_track(self)
+
+func _exit_tree() -> void:
+	if director != null and is_instance_valid(director) and director.has_method("unregister_track"):
+		director.unregister_track(self)
 
 ## Apply this track's patch (if any), install its bus + effects, and
 ## begin pattern playback (if any). Activation timing follows
@@ -232,8 +240,8 @@ func play_once() -> void:
 	var token: int = _play_once_token
 	var bpm: float = bpm_override
 	if bpm <= 0.0:
-		if director != null and director.data != null:
-			bpm = director.data.bpm
+		if director != null:
+			bpm = director.get_bpm()
 	if bpm <= 0.0:
 		bpm = 120.0
 	var seconds: float = pattern.get_play_length() * 60.0 / bpm
@@ -320,6 +328,56 @@ func swap_pattern(new_pattern: MusicPattern, mode: int = -1) -> void:
 		_resolve_start_state(resolved_mode)
 		_sync_cursor_to_now()
 
+## Play [param new_pattern] with its beat 0 on director beat [param origin_beat],
+## sounding from director beat [param from_beat] on (default: the origin; notes
+## of the pattern before it are skipped, a note exactly on it plays). Exact: the
+## pattern grid stays on the origin however late in a frame this is called, as
+## long as the director's clock has not passed [param from_beat] by more than
+## the frame. Ignores [member swap_mode] and [member sync_to_director]. Releases
+## sounding notes and activates the track if it is not active. A track on its
+## own clock ([member bpm_override]) just restarts the pattern next frame.
+## [MusicDataPlayer] calls this for a song section's PLAY slots; call it after
+## the director has started playing.
+func start_pattern_at(new_pattern: MusicPattern, origin_beat: float, from_beat: float = NAN) -> void:
+	var from: float = origin_beat if is_nan(from_beat) else from_beat
+	_release_all()
+	pattern = new_pattern
+	if not _active:
+		apply_patches()
+		_configure_bus()
+		_active = true
+	if bpm_override > 0.0:
+		_was_playing = false
+		return
+	_local_time = 0.0
+	_start_at_beat = from
+	_activated_at_beat = origin_beat
+	_was_playing = director != null and director.playing
+	_scanned_to = from - 0.0001
+	var length: float = pattern.get_play_length() if pattern != null else 0.0
+	var rel: float = from - origin_beat
+	if length <= 0.0 or rel <= 0.0001:
+		_prev_cursor = -0.001
+	else:
+		_prev_cursor = fposmod(rel, length) - 0.0001
+
+## Play everything due before director beat [param beat] (not on it) now: note-
+## offs, bends and pattern notes, resolved against the director's block as it is
+## now. [MusicDataPlayer] calls it when a song section ends partway through a
+## frame, before it swaps the progression, so the old section's last notes keep
+## the old harmony and nothing on the new section's first beat sounds early.
+## Does nothing for a track that is not playing, runs on its own clock, or has
+## already been played up to there.
+func flush_to(beat: float) -> void:
+	if synth == null or director == null or not _active or not _was_playing:
+		return
+	if bpm_override > 0.0 or not director.playing:
+		return
+	var target: float = beat - 0.0001
+	if target <= _scanned_to:
+		return
+	_advance(target)
+
 ## Re-apply effect chain + send target on this channel's auto-bus.
 ## Call after mutating [member effects] or [member output_bus] at
 ## runtime.
@@ -372,7 +430,12 @@ func _process(delta: float) -> void:
 	if using_override:
 		_local_time += delta
 
-	var effective: float = _effective_beats()
+	_advance(_effective_beats())
+
+# Play what is due up to [param effective]: note-offs, bends, pattern notes.
+func _advance(effective: float) -> void:
+	var using_override: bool = bpm_override > 0.0
+	_scanned_to = effective
 
 	# Release note-offs whose time has come.
 	var i: int = _active_notes.size() - 1
@@ -562,8 +625,8 @@ func _cancel_pending_bends(midi_handle: int, channel: int) -> void:
 func _effective_bpm() -> float:
 	if bpm_override > 0.0:
 		return bpm_override
-	if director != null and director.data != null:
-		return director.data.bpm
+	if director != null and (director.data != null or director.bpm_override > 0.0):
+		return director.get_bpm()
 	return 120.0
 
 ## Resolve a (index, octave, accidental) triple to a fractional MIDI number

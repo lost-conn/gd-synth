@@ -3,7 +3,9 @@ extends EditorScript
 
 # Editor bake tool: renders a whole-song scene (MusicDataPlayer + MusicTracks)
 # to a seamless looping AudioStreamWAV resource the game can play back on
-# low-end hardware instead of running the live synth.
+# low-end hardware instead of running the live synth. A player with a MusicSong
+# is rendered intro + one pass of the loop region, looping back to the loop entry
+# (SynthBaker.bake_music_song).
 #
 # Run from the editor: open this file, then File > Run (Ctrl+Shift+X).
 # Re-run whenever the patches / patterns / progression change.
@@ -29,13 +31,16 @@ func _run() -> void:
 		return
 	var root := scene.instantiate()
 	var song := SynthBaker.collect_song(root)
-	if song.data == null:
-		push_error("[bake_bgm] No MusicData found in %s" % SONG_SCENE)
+	if song.data == null and song.song == null:
+		push_error("[bake_bgm] No MusicData or MusicSong found in %s" % SONG_SCENE)
 		root.free()
 		return
 
-	var wav: AudioStreamWAV = SynthBaker.bake_song(
-		song.data, song.tracks, 0.0, MIX_RATE, 1.0, 1234, GAIN_MODE)
+	var wav: AudioStreamWAV
+	if song.song != null:
+		wav = SynthBaker.bake_music_song(song.song, song.tracks, 0.0, MIX_RATE, 1.0, 1234, GAIN_MODE)
+	else:
+		wav = SynthBaker.bake_song(song.data, song.tracks, 0.0, MIX_RATE, 1.0, 1234, GAIN_MODE)
 	root.free()
 	if wav == null:
 		push_error("[bake_bgm] Bake produced no audio.")

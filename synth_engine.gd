@@ -895,6 +895,37 @@ func render_loop_offline(events: Array, patches: Array, loop_seconds: float,
 	r.resize(loop_frames)
 	return _finish_offline(l, r, p_mix_rate, true)
 
+## [method render_loop_offline] for a loop with an intro: renders
+## [param total_seconds] (plus [param wrap_seconds] of overflow) and returns a
+## looping [AudioStreamWAV] that plays from the start once and then loops
+## [param loop_start_seconds] .. [param total_seconds]. The overflow past the end
+## is folded onto the loop start, so tails crossing the loop point wrap. (Tails
+## of the intro that ring past the loop start stay in it, and so are heard on
+## every pass, faintly.) loop_start 0 is a plain [method render_loop_offline].
+func render_intro_loop_offline(events: Array, patches: Array, total_seconds: float,
+		loop_start_seconds: float, wrap_seconds: float = 1.0, p_mix_rate: float = 22050.0,
+		p_seed: int = 1234) -> AudioStreamWAV:
+	var total_frames: int = int(round(total_seconds * p_mix_rate))
+	var start_frame: int = clampi(int(round(loop_start_seconds * p_mix_rate)), 0, maxi(total_frames - 1, 0))
+	var wrap_frames: int = int(round(wrap_seconds * p_mix_rate))
+	if total_frames <= 0:
+		_reset_offline_counters(0)
+		return _finish_offline(PackedFloat32Array(), PackedFloat32Array(), p_mix_rate, true)
+	var buf: Array = _render_events(events, patches, total_frames + wrap_frames, p_mix_rate, p_seed)
+	var l: PackedFloat32Array = buf[0]
+	var r: PackedFloat32Array = buf[1]
+	var loop_frames: int = total_frames - start_frame
+	var end: int = mini(l.size(), total_frames + wrap_frames)
+	for i in range(total_frames, end):
+		var j: int = start_frame + (i - total_frames) % loop_frames
+		l[j] += l[i]
+		r[j] += r[i]
+	l.resize(total_frames)
+	r.resize(total_frames)
+	var wav := _finish_offline(l, r, p_mix_rate, true)
+	wav.loop_begin = start_frame
+	return wav
+
 ## Render [param events] and return the float mix as [code][left, right][/code]
 ## (two [PackedFloat32Array]s of [param total_frames]) with [member master_gain]
 ## applied and nothing else: no clip, no ceiling, no 16-bit packing. For callers

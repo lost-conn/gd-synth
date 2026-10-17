@@ -73,10 +73,17 @@ func _collect(node: Node, root: Node) -> void:
 
 ## The scene's MusicDataPlayer progression (any node with a music_data property
 ## holding a MusicData; it may be a placeholder instance, which still answers get()).
+## A player with a MusicSong (a song property) plays the song instead: then this is
+## the song's progression, or its first section's (MusicSong.get_display_progression()).
 static func find_music_data(node: Node) -> MusicData:
 	return _find_music_data(node)
 
 static func _find_music_data(node: Node) -> MusicData:
+	var song: Variant = node.get("song")
+	if song is MusicSong:
+		var sd: MusicData = (song as MusicSong).get_display_progression()
+		if sd != null:
+			return sd
 	var d: Variant = node.get("music_data")
 	if d is MusicData:
 		return d
