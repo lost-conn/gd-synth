@@ -80,7 +80,7 @@ func _draw() -> void:
 	draw_string(font, Vector2(6.0 * s, plot.position.y + plot.size.y * 0.5 + fs * 0.4), "0.5", HORIZONTAL_ALIGNMENT_LEFT, gw - 8.0 * s, fs, dim)
 
 func _gui_input(event: InputEvent) -> void:
-	if roll == null or roll.pattern == null:
+	if roll == null or roll.pattern == null or roll.read_only:
 		return
 	if event is InputEventMouseButton:
 		var mb := event as InputEventMouseButton

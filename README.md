@@ -74,9 +74,28 @@ This means the synth is happily reusable for SFX even without music playing, the
 | `SynthPatch` | `.tres` | The Synth tab's Sound view. Or the inspector. Or notepad if you're feeling brave. |
 | `MusicPattern` | `.tres` | The Synth tab's Pattern view (piano roll). |
 | `PatternNote` | inline sub-resource | The Pattern view's inspector. |
+| `PatternChain` | `.tres` | Inspector (its steps). Opens read-only in the Pattern view. |
 | `MusicBlock` | inline or `.tres` | Inspector. Defines one chord + scale + duration. |
 | `MusicData` | `.tres` | Inspector. A list of MusicBlocks plus BPM. |
 | `SynthSampleSet` | `.res` | Nowhere — `SynthSampleBaker` makes it. A patch, baked to samples. |
+
+## Chaining patterns: `PatternChain`
+
+A `PatternChain` is a `MusicPattern` made of other patterns, so it goes anywhere a pattern does: `MusicTrack.pattern`, `swap_pattern()`, the bake. Its `steps` (`PatternChainStep` resources) play one after another and the chain loops at the end of the last one:
+
+```gdscript
+var verse := PatternChain.new()
+verse.add_step(riff, 2)               # riff twice
+verse.add_step(riff, 1, 1, 0.7)       # then once, an octave up, at 70% velocity
+verse.add_step(fill)
+track.pattern = verse
+```
+
+Each step has a `pattern` (which may itself be a chain), `repeats` (at least 1), `octave_shift` and `velocity_scale`. The chain plays exactly as one long pattern would: every note is copied with its beat moved to its place in the chain, its octave (and its bends' octaves) shifted and its velocity scaled and clamped to 0..1, then resolved against the director's current chord / scale like any other note. The source patterns are never changed. A chain's length is the sum of `length_beats * repeats` over its steps. A step that would contain the chain it sits in (a cycle) is skipped with a warning.
+
+`notes` and `length_beats` are derived on a chain, so they are hidden and not saved. **Read what a pattern plays through `get_play_notes()` and `get_play_length()`**, which every `MusicPattern` has (a plain pattern returns `notes` and `length_beats`). The flattened result is cached; a change to the steps, or to the length or note count of a step's pattern, rebuilds it, and in the editor so does any edit to a note. A game that edits a source note's fields in code after the chain has played calls `invalidate()` on the chain.
+
+In the Synth tab a chain opens read-only in the Pattern view (the roll shows the flattened notes) and draws in the Track view like any pattern. Edit its steps in Godot's inspector.
 
 ## Editor tools
 

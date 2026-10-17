@@ -630,8 +630,8 @@ func get_lane_summary() -> Array:
 	for i in tracks.size():
 		var t := tracks[i]
 		var clips := 0
-		if t.pattern != null and t.pattern.length_beats > 0.0:
-			clips = int(ceilf(timeline.span / t.pattern.length_beats - 0.0001))
+		if t.pattern != null and t.pattern.get_play_length() > 0.0:
+			clips = int(ceilf(timeline.span / t.pattern.get_play_length() - 0.0001))
 		out.append({"name": String(t.name), "type": int(t.track_type), "channel": t.synth_channel,
 				"pattern": t.pattern.resource_path.get_file() if t.pattern != null else "-", "clips": clips,
 				"audible": is_audible(i)})
@@ -729,9 +729,10 @@ func _res_sig(r: Resource) -> String:
 	var p := r as MusicPattern
 	if p != null:
 		var acc := 0.0
-		for n in p.notes:
+		var play_notes := p.get_play_notes()
+		for n in play_notes:
 			acc += n.beat * 7.0 + n.duration * 3.0 + float(n.index) * 13.0 + float(n.octave) * 17.0
-		s += ":%s:%d:%s:%d" % [p.length_beats, p.notes.size(), acc, int(p.editor_track_type)]
+		s += ":%s:%d:%s:%d" % [p.get_play_length(), play_notes.size(), acc, int(p.editor_track_type)]
 	return s
 
 func _on_poll() -> void:
@@ -781,7 +782,7 @@ func _rebuild() -> void:
 	var longest := 0.0
 	for t in tracks:
 		if t.pattern != null:
-			longest = maxf(longest, t.pattern.length_beats)
+			longest = maxf(longest, t.pattern.get_play_length())
 	timeline.span = SynthTimeline.choose_span(timeline.progression_beats(), longest)
 
 	if _selected_index() < 0:

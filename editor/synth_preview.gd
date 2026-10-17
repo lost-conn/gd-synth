@@ -328,7 +328,7 @@ func play_pattern(pattern: MusicPattern, track_type: int, base_octave: int) -> v
 	track.activate()
 	var data: MusicData = get_effective_music_data()
 	director.data = data
-	_end_beat = _one_shot_end_beat(data, pattern.length_beats if pattern != null else 0.0)
+	_end_beat = _one_shot_end_beat(data, pattern.get_play_length() if pattern != null else 0.0)
 	director.play()
 	_sync_playing()
 
@@ -377,7 +377,7 @@ func play_song(lanes: Array, start_beat: float = 0.0) -> void:
 		song_tracks.append(t)
 		_song_audible.append(bool(spec.get("audible", true)))
 		if t.pattern != null:
-			longest = maxf(longest, t.pattern.length_beats)
+			longest = maxf(longest, t.pattern.get_play_length())
 	var data: MusicData = get_effective_music_data()
 	director.data = data
 	for i in song_tracks.size():

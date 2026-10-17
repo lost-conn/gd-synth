@@ -43,19 +43,22 @@ func _notification(what: int) -> void:
 ## pattern or the track's type changed.
 func rebuild() -> void:
 	_ticks.clear()
-	if pattern != null and not pattern.notes.is_empty():
+	var play_notes: Array[PatternNote] = []
+	if pattern != null:
+		play_notes = pattern.get_play_notes()
+	if not play_notes.is_empty():
 		var block: MusicBlock = timeline.data.blocks[0] if timeline != null and timeline.data != null and not timeline.data.blocks.is_empty() else null
 		var rpo := SynthPitchMap.rows_per_octave(track_type, block)
 		var lo := 1 << 30
 		var hi := -(1 << 30)
 		var rows: Array = []
-		for n in pattern.notes:
+		for n in play_notes:
 			var r := SynthPitchMap.display_row(track_type, n.index, n.octave, rpo)
 			rows.append(r)
 			lo = mini(lo, r)
 			hi = maxi(hi, r)
-		for i in pattern.notes.size():
-			var n: PatternNote = pattern.notes[i]
+		for i in play_notes.size():
+			var n: PatternNote = play_notes[i]
 			var h := 0.5 if hi == lo else float(rows[i] - lo) / float(hi - lo)
 			_ticks.append([n.beat, n.duration, h])
 	queue_redraw()
@@ -63,18 +66,18 @@ func rebuild() -> void:
 ## Rect of the first clip, for tests and hit-testing.
 func clip_rect(repeat: int = 0) -> Rect2:
 	var s := SynthRackStyle.scale(self)
-	if pattern == null or pattern.length_beats <= 0.0 or timeline == null:
+	if pattern == null or pattern.get_play_length() <= 0.0 or timeline == null:
 		return Rect2()
-	var start := float(repeat) * pattern.length_beats
+	var start := float(repeat) * pattern.get_play_length()
 	var x0 := timeline.x_of(start, size.x)
-	var x1 := timeline.x_of(minf(start + pattern.length_beats, timeline.span), size.x)
+	var x1 := timeline.x_of(minf(start + pattern.get_play_length(), timeline.span), size.x)
 	return Rect2(x0 + 1.0, 4.0 * s, maxf(2.0, x1 - x0 - 2.0), size.y - 8.0 * s)
 
 func _clip_at(pos: Vector2) -> bool:
-	if pattern == null or pattern.length_beats <= 0.0 or timeline == null:
+	if pattern == null or pattern.get_play_length() <= 0.0 or timeline == null:
 		return false
-	var reps := int(ceilf(timeline.span / pattern.length_beats - 0.0001))
-	var rep := int(floorf(timeline.beat_of(pos.x, size.x) / pattern.length_beats))
+	var reps := int(ceilf(timeline.span / pattern.get_play_length() - 0.0001))
+	var rep := int(floorf(timeline.beat_of(pos.x, size.x) / pattern.get_play_length()))
 	return rep >= 0 and rep < reps and clip_rect(rep).has_point(pos)
 
 func _gui_input(event: InputEvent) -> void:
@@ -89,7 +92,7 @@ func _get_tooltip(at_position: Vector2) -> String:
 	if pattern == null:
 		return "This track has no pattern."
 	if _clip_at(at_position):
-		return "%s: %s beats, %d notes, repeating.\nDouble-click to edit it in Pattern." % [clip_name, pattern.length_beats, pattern.notes.size()]
+		return "%s: %s beats, %d notes, repeating.\nDouble-click to edit it in Pattern." % [clip_name, pattern.get_play_length(), pattern.get_play_notes().size()]
 	return ""
 
 func _draw() -> void:
@@ -108,19 +111,19 @@ func _draw() -> void:
 		draw_line(Vector2(x, 0), Vector2(x, size.y), Color(grid, grid.a * 2.2), 1.0)
 	var font := SynthRackStyle.font(self)
 	var fs := SynthRackStyle.font_size(self, 0.8)
-	if pattern == null or pattern.length_beats <= 0.0:
+	if pattern == null or pattern.get_play_length() <= 0.0:
 		draw_string(font, Vector2(8.0 * s, size.y * 0.5 + 4.0 * s), "no pattern",
 				HORIZONTAL_ALIGNMENT_LEFT, size.x - 16.0 * s, fs, SynthRackStyle.dim(self))
 	else:
 		var alpha := 1.0 if audible else 0.35
-		var reps := int(ceilf(timeline.span / pattern.length_beats - 0.0001))
+		var reps := int(ceilf(timeline.span / pattern.get_play_length() - 0.0001))
 		for rep in reps:
 			var r := clip_rect(rep)
 			draw_rect(r, Color(color, 0.22 * alpha))
 			draw_rect(r, Color(color, 0.85 * alpha), false, 1.0)
 			var inner := r.grow(-3.0 * s)
 			var nh := clampf(inner.size.y / 12.0, 2.0, 4.0 * s)
-			var start := float(rep) * pattern.length_beats
+			var start := float(rep) * pattern.get_play_length()
 			for t in _ticks:
 				var bx: float = timeline.x_of(start + t[0], size.x)
 				if bx >= r.end.x - 0.5:

@@ -187,15 +187,15 @@ class Settings:
 ## [param data] — a director-driven track, resolved block by block as
 ## [SynthBaker] flattens it.
 static func add_track_usage(usage: Usage, info, data: MusicData, swing: float = 0.0) -> void:
-	if info == null or info.pattern == null or info.pattern.length_beats <= 0.0:
+	if info == null or info.pattern == null or info.pattern.get_play_length() <= 0.0:
 		return
 	if data == null or data.blocks.is_empty():
 		return
 	var spb: float = 60.0 / (data.bpm if data.bpm > 0.0 else 120.0)
 	var loop_beats: float = SynthBaker._loop_beats(data, [info])
-	var length: float = info.pattern.length_beats
+	var length: float = info.pattern.get_play_length()
 	for rep in int(round(loop_beats / length)):
-		for note in info.pattern.notes:
+		for note in info.pattern.get_play_notes():
 			var fire: float = rep * length + fposmod(SynthBaker._swung(note.beat, swing), length)
 			var block := SynthBaker._block_at(data, fire)
 			_add_note_usage(usage, note, info.track_type, info.base_octave, block, spb)
@@ -213,7 +213,7 @@ static func add_pattern_usage(usage: Usage, pattern: MusicPattern, track_type: i
 	var ctx: Array = blocks
 	if track_type == MusicTrack.TrackType.DRUM or ctx.is_empty():
 		ctx = [null]
-	for note in pattern.notes:
+	for note in pattern.get_play_notes():
 		for block in ctx:
 			_add_note_usage(usage, note, track_type, base_octave, block, spb)
 

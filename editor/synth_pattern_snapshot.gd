@@ -26,6 +26,10 @@ static func fingerprint(p: MusicPattern) -> String:
 	return var_to_str(_capture_data(p, false))
 
 static func _capture_data(p: MusicPattern, with_refs: bool) -> Dictionary:
+	# A PatternChain's notes and length are derived from its steps: only its
+	# editor hint is the view's to edit.
+	if p is PatternChain:
+		return {"length": 0.0, "type": int(p.editor_track_type), "notes": []}
 	var notes: Array = []
 	for n in p.notes:
 		var e := {
@@ -57,6 +61,10 @@ func same_as(other: SynthPatternSnapshot) -> bool:
 ## every view of it (roll, lane, inspector, Godot's own inspector) refreshes.
 func apply() -> void:
 	if pattern == null:
+		return
+	if pattern is PatternChain:
+		pattern.editor_track_type = data["type"]
+		pattern.emit_changed()
 		return
 	pattern.length_beats = data["length"]
 	pattern.editor_track_type = data["type"]

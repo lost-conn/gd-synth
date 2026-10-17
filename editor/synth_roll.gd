@@ -81,6 +81,12 @@ var pattern: MusicPattern:
 		selection_changed.emit()
 		queue_redraw()
 
+## Show the pattern without letting it be edited: seeking, scrolling and zooming
+## work; nothing creates, moves, deletes or selects a note. The Pattern view sets
+## it when the pattern is a PatternChain, whose notes are drawn from a flattened
+## copy.
+var read_only: bool = false
+
 var track_type: int = MusicTrack.TrackType.CHORD:
 	set(value):
 		if value == track_type:
@@ -698,7 +704,7 @@ func _clear_bend_selection() -> void:
 ## Add a bend to the selected note(s), or a sub-bend to the selected bend, aimed at
 ## the row under the mouse (two rows up when the mouse is elsewhere).
 func add_bend_at_mouse() -> void:
-	if pattern == null:
+	if pattern == null or read_only:
 		return
 	var inside := _mouse_inside and _area.has_point(_mouse)
 	var step := snap_step
@@ -752,7 +758,7 @@ func _entry_for(bend: PatternBend) -> Dictionary:
 	return {}
 
 func remove_selected_bend() -> void:
-	if _sel_bend == null:
+	if _sel_bend == null or read_only:
 		return
 	begin_edit()
 	_sel_bend_parent.erase(_sel_bend)
@@ -766,7 +772,7 @@ func remove_selected_bend() -> void:
 
 ## Start recording a gesture: the pattern as it is now is what Undo restores.
 func begin_edit() -> void:
-	if pattern != null and _edit_before == null:
+	if pattern != null and _edit_before == null and not read_only:
 		_edit_before = SynthPatternSnapshot.capture(pattern)
 
 ## Finish the gesture. If anything changed, [signal edit_committed] fires once.
@@ -829,7 +835,7 @@ func _on_button(ev: InputEventMouseButton) -> void:
 			else:
 				_end_drag()
 		MOUSE_BUTTON_RIGHT:
-			if ev.pressed and _area.has_point(pos):
+			if ev.pressed and not read_only and _area.has_point(pos):
 				var hit := _bend_at(pos)
 				if not hit.is_empty():
 					begin_edit()
@@ -861,7 +867,7 @@ func _press(ev: InputEventMouseButton) -> void:
 		if pos.y >= get_ruler_height():
 			row_auditioned.emit(y_to_row(pos.y))
 		return
-	if not _area.has_point(pos):
+	if read_only or not _area.has_point(pos):
 		return
 	var hit := _bend_at(pos)
 	if not hit.is_empty():
@@ -1122,7 +1128,7 @@ func _commit_marquee() -> void:
 # ---------------------------------------------------------------------------
 
 func _on_key(ev: InputEventKey) -> void:
-	if not ev.pressed or pattern == null:
+	if not ev.pressed or pattern == null or read_only:
 		return
 	var cmd := ev.ctrl_pressed or ev.meta_pressed
 	if cmd:
@@ -1160,7 +1166,7 @@ func _on_key(ev: InputEventKey) -> void:
 ## pitch ([param octave]: rows means octaves). With a bend selected, its offset
 ## and target move instead. False when there was nothing to move.
 func nudge(steps: int, rows: int, octave: bool = false) -> bool:
-	if pattern == null:
+	if pattern == null or read_only:
 		return false
 	if _sel_bend != null:
 		var b := _sel_bend
@@ -1192,6 +1198,8 @@ func nudge(steps: int, rows: int, octave: bool = false) -> bool:
 	return true
 
 func delete_selection() -> void:
+	if read_only:
+		return
 	if _sel_bend != null:
 		remove_selected_bend()
 		return
@@ -1223,7 +1231,7 @@ func has_clipboard() -> bool:
 	return not _clipboard.is_empty()
 
 func paste() -> void:
-	if _clipboard.is_empty() or pattern == null:
+	if _clipboard.is_empty() or pattern == null or read_only:
 		return
 	var anchor := 0.0
 	if _mouse_inside and _mouse.x >= _area.position.x:
@@ -1244,7 +1252,7 @@ func paste() -> void:
 	end_edit("Paste notes")
 
 func duplicate_selection() -> void:
-	if _selected.is_empty():
+	if _selected.is_empty() or read_only:
 		return
 	begin_edit()
 	var made: Array = []

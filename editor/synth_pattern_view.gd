@@ -36,6 +36,12 @@ extends VBoxContainer
 #                 elsewhere (Godot's inspector, Ctrl+Z) arrive through `changed`
 #                 on the pattern and its notes and refresh the view.
 #
+# A PatternChain (steps of other patterns, see pattern_chain.gd) opens read-only:
+# the roll draws a flattened copy of what the chain plays, nothing in the roll,
+# the velocity lane or the inspector edits it, and a banner says where to edit
+# the steps (Godot's inspector; editing a chain here comes later). The Type menu
+# still sets the chain's own editor hint.
+#
 # Playback and note auditioning go through the shared SynthPreview.
 
 signal sound_requested
@@ -88,12 +94,16 @@ var _after_save: Callable = Callable()
 var _inspector_pref: int = -1       # -1 auto, 0 hidden, 1 shown
 var _audition_tickets: Dictionary = {}
 var _built: bool = false
+# The plain pattern the roll draws while the pattern is a PatternChain: a flattened
+# copy, refreshed when the chain or a pattern under it changes.
+var _proxy: MusicPattern
 
 var _name_label: Label
 var _path_label: Label
 var _type_opt: OptionButton
 var _match_btn: Button
 var _length_spin: SpinBox
+var _chain_banner: Label
 var _snap_opt: OptionButton
 var _patch_btn: Button
 var _offer_btn: Button
@@ -119,6 +129,7 @@ func _ready() -> void:
 	size_flags_vertical = Control.SIZE_EXPAND_FILL
 	add_theme_constant_override("separation", 6)
 	_build_header()
+	_build_chain_banner()
 	_build_body()
 	_build_dialogs()
 	if undo_redo != null and undo_redo.has_signal(&"history_changed"):
@@ -247,6 +258,15 @@ func _build_header() -> void:
 		_inspector_pref = 1 if on else 0
 		_relayout())
 	bar.add_child(_inspector_btn)
+
+func _build_chain_banner() -> void:
+	_chain_banner = Label.new()
+	_chain_banner.text = "This is a PatternChain: it plays the patterns in its steps one after another. " \
+			+ "Edit its steps in Godot's inspector (editing chains here comes later). The roll shows what it plays, read-only."
+	_chain_banner.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
+	_chain_banner.add_theme_color_override("font_color", SynthRackStyle.warn(self))
+	_chain_banner.visible = false
+	add_child(_chain_banner)
 
 func _head_label(text: String) -> Label:
 	var l := Label.new()
@@ -417,12 +437,32 @@ func _new_pattern() -> MusicPattern:
 	p.length_beats = 4.0
 	return p
 
+# What the roll draws for [param p]: the pattern itself, or for a PatternChain a
+# plain copy of what it plays.
+func _display_for(p: MusicPattern) -> MusicPattern:
+	if not (p is PatternChain):
+		return p
+	if _proxy == null:
+		_proxy = MusicPattern.new()
+	_sync_proxy(p as PatternChain)
+	return _proxy
+
+func _sync_proxy(chain: PatternChain = null) -> void:
+	if chain == null:
+		chain = pattern as PatternChain
+	if chain == null or _proxy == null:
+		return
+	_proxy.length_beats = chain.get_play_length()
+	_proxy.editor_track_type = chain.editor_track_type
+	_proxy.notes = chain.get_play_notes().duplicate()
+
 func _attach(p: MusicPattern, path: String) -> void:
 	_unwatch()
 	_audition_off()
 	pattern = p
 	current_path = path
-	_roll.pattern = p
+	_roll.read_only = p is PatternChain
+	_roll.pattern = _display_for(p)
 	_roll.snap_step = 1.0 / float(_snap_opt.get_selected_id())
 	_apply_type(true, true)
 	_clean_fp = SynthPatternSnapshot.fingerprint(p)
@@ -490,10 +530,11 @@ func _infer_type(full: bool) -> Dictionary:
 	# Nothing plays it: guess from the notes.
 	var type := MusicTrack.TrackType.CHORD
 	var why := "no notes yet, so the default (chord)"
-	if not pattern.notes.is_empty():
+	var guess_notes := pattern.get_play_notes()
+	if not guess_notes.is_empty():
 		var all_drum := true
 		var any_acc := false
-		for n in pattern.notes:
+		for n in guess_notes:
 			if n.index < 27:
 				all_drum = false
 			if n.accidental != 0.0:
@@ -599,7 +640,12 @@ func _refresh_header() -> void:
 	_type_opt.select(_type_opt.get_item_index(hint + 1))
 	_type_opt.tooltip_text = "Saved with the pattern (editor_track_type): %s." % SynthPitchMap.type_name(hint) \
 			if hint != AUTO else _inferred.get("source", "")
-	_length_spin.set_value_no_signal(pattern.length_beats)
+	var is_chain := pattern is PatternChain
+	_length_spin.set_value_no_signal(pattern.get_play_length())
+	_length_spin.editable = not is_chain
+	_length_spin.tooltip_text = "The sum of the steps' lengths, from the chain's steps." if is_chain \
+			else "How many beats before the pattern loops."
+	_chain_banner.visible = is_chain
 	var p := _shared_patch()
 	var ppath := _shared_patch_path()
 	_patch_btn.text = ppath.get_file() if ppath != "" else ((p.patch_name + " (unsaved)") if p != null else "(none yet)")
@@ -787,7 +833,7 @@ func _refresh_faint() -> void:
 		return
 	var data := _data()
 	var type := get_effective_type()
-	var length := pattern.length_beats
+	var length := pattern.get_play_length()
 	var i := 0
 	for t in song_context.tracks:
 		var pat: MusicPattern = t["pattern"]
@@ -795,11 +841,11 @@ func _refresh_faint() -> void:
 		i += 1
 		if pat == null or pat == pattern or (current_path != "" and t["pattern_path"] == current_path):
 			continue
-		var plen := maxf(pat.length_beats, 0.25)
+		var plen := maxf(pat.get_play_length(), 0.25)
 		var list: Array = []
 		var rep := 0
 		while float(rep) * plen < length - 0.0001:
-			for n in pat.notes:
+			for n in pat.get_play_notes():
 				var beat: float = n.beat + float(rep) * plen
 				if beat >= length - 0.0001:
 					continue
@@ -836,10 +882,26 @@ func _watch() -> void:
 	_unwatch()
 	if pattern == null:
 		return
-	_watch_one(pattern)
-	for n in pattern.notes:
-		_watch_one(n)
-		_watch_bends(n.bends)
+	_watch_pattern(pattern, [])
+
+# Watch [param p] and its notes; for a chain, its steps and the patterns under them
+# too, so a step pattern edited elsewhere refreshes the roll. [param seen] stops a
+# cycle.
+func _watch_pattern(p: MusicPattern, seen: Array) -> void:
+	if p == null or seen.has(p):
+		return
+	seen.append(p)
+	_watch_one(p)
+	if p is PatternChain:
+		for step in (p as PatternChain).steps:
+			if step == null:
+				continue
+			_watch_one(step)
+			_watch_pattern(step.pattern, seen)
+	else:
+		for n in p.notes:
+			_watch_one(n)
+			_watch_bends(n.bends)
 
 func _watch_bends(bends: Array) -> void:
 	for b in bends:
@@ -868,6 +930,8 @@ func _deferred_refresh() -> void:
 	if pattern == null or not _built:
 		return
 	_watch()
+	if pattern is PatternChain:
+		_sync_proxy()
 	_roll.refresh()
 	_lane.queue_redraw()
 	_playhead.queue_redraw()
@@ -879,6 +943,8 @@ func _deferred_refresh() -> void:
 # ---------------------------------------------------------------------------
 
 func _on_edit_committed(label: String, before: SynthPatternSnapshot) -> void:
+	if pattern is PatternChain:
+		return    # the roll shows a copy of a chain and cannot edit it
 	_record(label, before, false)
 
 ## Make what was just done to the pattern one undo action. [param before] is the
@@ -902,7 +968,7 @@ func _record(label: String, before: SynthPatternSnapshot, merge: bool) -> void:
 
 func _on_note_field(prop: StringName, value: float) -> void:
 	var sel := _roll.get_selected()
-	if sel.is_empty():
+	if sel.is_empty() or pattern is PatternChain:
 		return
 	var before := SynthPatternSnapshot.capture(pattern)
 	for n in sel:
@@ -916,7 +982,7 @@ func _on_note_field(prop: StringName, value: float) -> void:
 
 func _on_bend_field(prop: StringName, value: float) -> void:
 	var e := _roll.get_selected_bend()
-	if e.is_empty():
+	if e.is_empty() or pattern is PatternChain:
 		return
 	var before := SynthPatternSnapshot.capture(pattern)
 	var b: PatternBend = e["bend"]
@@ -935,7 +1001,7 @@ func _on_type_selected(idx: int) -> void:
 	_record("Set track type", before, false)
 
 func _on_length_changed(v: float) -> void:
-	if pattern == null or is_equal_approx(v, pattern.length_beats):
+	if pattern == null or pattern is PatternChain or is_equal_approx(v, pattern.length_beats):
 		return
 	var before := SynthPatternSnapshot.capture(pattern)
 	pattern.length_beats = v
@@ -1121,11 +1187,12 @@ func toggle_preview() -> void:
 		start_preview()
 
 func _on_seek(beat: float) -> void:
-	if _preview == null or _preview.director == null or pattern == null or pattern.length_beats <= 0.0:
+	if _preview == null or _preview.director == null or pattern == null or pattern.get_play_length() <= 0.0:
 		return
 	var d := _preview.director
-	var loop_index := floorf(d.get_total_beats() / pattern.length_beats)
-	d.seek(loop_index * pattern.length_beats + beat)
+	var length := pattern.get_play_length()
+	var loop_index := floorf(d.get_total_beats() / length)
+	d.seek(loop_index * length + beat)
 	_playhead.queue_redraw()
 
 func _on_note_auditioned(n: PatternNote) -> void:

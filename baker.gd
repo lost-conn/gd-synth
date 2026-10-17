@@ -97,7 +97,7 @@ static func bake_song(data: MusicData, tracks: Array, swing: float = 0.0,
 	var patches: Array = []
 	patches.resize(16)
 	for info in tracks:
-		if info == null or info.pattern == null or info.pattern.length_beats <= 0.0:
+		if info == null or info.pattern == null or info.pattern.get_play_length() <= 0.0:
 			continue
 		if info.channel >= 0 and info.channel < 16:
 			patches[info.channel] = info.patch
@@ -122,7 +122,7 @@ static func bake_pattern(pattern: MusicPattern, patch: SynthPatch, track_type: i
 		loop: bool = false, seed: int = 1234,
 		gain_mode: int = SynthEngine.OfflineGain.LIMIT_PEAK) -> AudioStreamWAV:
 	last_stats = {}
-	if pattern == null or pattern.notes.is_empty() or pattern.length_beats <= 0.0:
+	if pattern == null or pattern.get_play_notes().is_empty() or pattern.get_play_length() <= 0.0:
 		return null
 	var spb: float = 60.0 / maxf(bpm, 1.0)
 
@@ -133,7 +133,7 @@ static func bake_pattern(pattern: MusicPattern, patch: SynthPatch, track_type: i
 
 	var events: Array = []
 	var last_off: float = 0.0
-	for note in pattern.notes:
+	for note in pattern.get_play_notes():
 		var midi: float = _resolve(track_type, block, base_octave, note.index, note.octave, note.accidental)
 		var handle: int = roundi(midi)
 		events.append([note.beat * spb, SynthEngine.CMD_NOTE_ON, 0, midi, note.velocity, 0.0])
@@ -146,7 +146,7 @@ static func bake_pattern(pattern: MusicPattern, patch: SynthPatch, track_type: i
 	synth.offline_gain_mode = gain_mode
 	var wav: AudioStreamWAV
 	if loop:
-		wav = synth.render_loop_offline(events, [patch], pattern.length_beats * spb, 1.0, mix_rate, seed)
+		wav = synth.render_loop_offline(events, [patch], pattern.get_play_length() * spb, 1.0, mix_rate, seed)
 	else:
 		# Tail = envelope ring-out after the final note-off (patches are sustain=0,
 		# so release dominates; noise_decay covers cymbal-like tails).
@@ -159,11 +159,11 @@ static func bake_pattern(pattern: MusicPattern, patch: SynthPatch, track_type: i
 # Emit note-on/off (+ bend) events for one track across the whole loop.
 static func _flatten_track(events: Array, info: TrackInfo, data: MusicData,
 		loop_beats: float, swing: float, spb: float, bpm: float) -> void:
-	var length: float = info.pattern.length_beats
+	var length: float = info.pattern.get_play_length()
 	var reps: int = int(round(loop_beats / length))
 	for rep in reps:
 		var base_beat: float = rep * length
-		for note in info.pattern.notes:
+		for note in info.pattern.get_play_notes():
 			var local: float = fposmod(_swung(note.beat, swing), length)
 			var fire_beat: float = base_beat + local
 			if fire_beat >= loop_beats - 1e-6:
@@ -246,9 +246,9 @@ static func _loop_beats(data: MusicData, tracks: Array) -> float:
 		prog += float(blk.duration_beats)
 	var acc: int = int(round(prog * _TICKS)) if prog > 0.0 else _TICKS
 	for info in tracks:
-		if info == null or info.pattern == null or info.pattern.length_beats <= 0.0:
+		if info == null or info.pattern == null or info.pattern.get_play_length() <= 0.0:
 			continue
-		var t: int = int(round(info.pattern.length_beats * _TICKS))
+		var t: int = int(round(info.pattern.get_play_length() * _TICKS))
 		if t > 0:
 			acc = _lcm(acc, t)
 	return float(acc) / float(_TICKS)

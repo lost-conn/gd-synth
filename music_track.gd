@@ -211,7 +211,7 @@ func is_active() -> bool:
 ## call's deferred deactivate fires (older awaits no-op via token check).
 func play_once() -> void:
 	activate()
-	if pattern == null or pattern.length_beats <= 0.0:
+	if pattern == null or pattern.get_play_length() <= 0.0:
 		return
 	_play_once_token += 1
 	var token: int = _play_once_token
@@ -221,7 +221,7 @@ func play_once() -> void:
 			bpm = director.data.bpm
 	if bpm <= 0.0:
 		bpm = 120.0
-	var seconds: float = pattern.length_beats * 60.0 / bpm
+	var seconds: float = pattern.get_play_length() * 60.0 / bpm
 	await get_tree().create_timer(seconds).timeout
 	if token == _play_once_token:
 		deactivate()
@@ -316,20 +316,23 @@ func _process(delta: float) -> void:
 				_pending_bends.remove_at(bi)
 			bi -= 1
 
-	if pattern == null or pattern.notes.is_empty():
+	if pattern == null:
+		return
+	var play_notes: Array[PatternNote] = pattern.get_play_notes()
+	if play_notes.is_empty():
 		return
 
 	if effective < _start_at_beat - 0.001:
 		return  # pending — waiting for the swap_mode-defined start point
 
 	var relative: float = effective - _activated_at_beat
-	var length: float = pattern.length_beats
+	var length: float = pattern.get_play_length()
 	if length <= 0.0:
 		return
 	var cursor: float = fposmod(relative, length)
 	var wrapped: bool = cursor < _prev_cursor - 0.001
 
-	for note in pattern.notes:
+	for note in play_notes:
 		var note_beat: float = note.beat
 		if not using_override and director != null:
 			note_beat = director.get_swung_beat(note.beat)
@@ -398,7 +401,8 @@ func _next_block_start_effective(effective: float) -> float:
 ## - Mid-pattern start (sync_to_director=true): cursor at director's
 ##   absolute position, so historical notes don't stampede.
 func _sync_cursor_to_now() -> void:
-	if pattern == null or pattern.length_beats <= 0.0:
+	var length: float = pattern.get_play_length() if pattern != null else 0.0
+	if length <= 0.0:
 		_prev_cursor = -0.001
 		return
 	var effective: float = _effective_beats()
@@ -409,7 +413,7 @@ func _sync_cursor_to_now() -> void:
 	if relative <= 0.001:
 		_prev_cursor = -0.001
 	else:
-		_prev_cursor = fposmod(relative, pattern.length_beats)
+		_prev_cursor = fposmod(relative, length)
 
 # ---------------------------------------------------------------------------
 # Note resolution
