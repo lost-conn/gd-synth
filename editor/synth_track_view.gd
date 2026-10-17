@@ -395,6 +395,10 @@ func _build_body() -> void:
 	_inspector.make_chain_requested.connect(func(): make_chain(_selected_index()))
 	_inspector.unwrap_chain_requested.connect(func(): unwrap_chain(_selected_index()))
 	_inspector.save_chain_requested.connect(_ask_save_chain)
+	_inspector.piece_edited.connect(func(piece: int, prop: StringName, value: Variant, merge: bool):
+		set_piece_property(_selected_index(), piece, prop, value, merge))
+	_inspector.piece_action.connect(_on_piece_action)
+	_inspector.make_kit_requested.connect(func(): make_kit(_selected_index()))
 	body.add_child(_inspector)
 
 func _build_drawer(parent: Control) -> void:
@@ -735,8 +739,9 @@ func _signature() -> String:
 		var list: Array[MusicTrack] = []
 		_collect(_root, list)
 		for t in list:
-			s += "%s,%d,%d,%d,%d,%.3f,%s,%d,%s,%s,%s;" % [t.name, t.track_type, t.synth_channel, t.base_octave, t.swap_mode,
-					t.pan, t.output_bus, t.effects.size(), _res_sig(t.pattern), _res_sig(t.patch), t.get_index()]
+			s += "%s,%d,%d,%d,%d,%.3f,%s,%d,%s,%s,%s,%s;" % [t.name, t.track_type, t.synth_channel, t.base_octave, t.swap_mode,
+					t.pan, t.output_bus, t.effects.size(), _res_sig(t.pattern), _res_sig(t.patch), t.get_index(),
+					"-" if t.kit == null else "%d:%s" % [t.kit.get_instance_id(), t.kit.signature()]]
 		var d := SynthSongContext.find_music_data(_root)
 		s += "D%s" % (str(d.get_instance_id()) if d != null else "-")
 	s += "|" + SynthHarmony.fingerprint(_display_data())
@@ -857,7 +862,7 @@ func _rebuild_lanes() -> void:
 		_lane_box.add_child(lane)
 		var color: Color = SynthPatternView.FAINT_COLORS[i % SynthPatternView.FAINT_COLORS.size()]
 		lane.setup(String(t.name), _lane_sub(t), "%s\n%s" % [_track_path(t), _lane_tip(t)], color)
-		lane.set_warning(SynthSongContext.clash_text(t.pattern, int(t.track_type)))
+		lane.set_warning(_lane_warning(t))
 		lane.set_gutter(_gutter())
 		lane.clips.timeline = timeline
 		lane.clips.pattern = t.pattern
@@ -886,10 +891,29 @@ func _rebuild_lanes() -> void:
 
 func _lane_sub(t: MusicTrack) -> String:
 	var type_name: String = SynthTrackInspector.TYPE_NAMES[clampi(int(t.track_type), 0, 2)]
+	if t.uses_kit():
+		var r := SynthSongContext.channel_range(t)
+		return "%s kit  ch%d-%d" % [type_name, r.x, r.y]
 	return "%s  ch%d%s" % [type_name, t.synth_channel, "" if t.track_type == MusicTrack.TrackType.DRUM else "  oct %d" % t.base_octave]
 
 func _lane_tip(t: MusicTrack) -> String:
+	if t.uses_kit():
+		var names := PackedStringArray()
+		for p in t.kit.pieces:
+			names.append(SynthPitchMap.piece_name(p) if p != null else "(empty)")
+		return "Kit: %s\nPattern: %s" % [", ".join(names), _res_name(t.pattern, "none")]
 	return "Patch: %s\nPattern: %s" % [_res_name(t.patch, "none"), _res_name(t.pattern, "none")]
+
+# The lane's warnings: the pattern's type, and a kit's channels.
+func _lane_warning(t: MusicTrack) -> String:
+	var lines := PackedStringArray()
+	var clash := SynthSongContext.clash_text(t.pattern, int(t.track_type))
+	if clash != "":
+		lines.append(clash)
+	var kit := SynthSongContext.kit_warning(t, tracks)
+	if kit != "":
+		lines.append(kit)
+	return "\n".join(lines)
 
 static func _res_name(res: Resource, fallback: String) -> String:
 	if res == null:
@@ -947,7 +971,7 @@ func _refresh_inspector() -> void:
 	if live and not can_remove:
 		tip = "Only a track that belongs directly to this scene and has no children can be removed here."
 	var bake := ""
-	if t.patch != null:
+	if t.patch != null and not t.uses_kit():
 		var info: SynthBakeInfo.Info = _bake_infos.get(SynthSongContext.path_of(t.patch))
 		if info != null:
 			bake = "Bake: %s." % info.chip_text().to_lower().replace("bake ", "")
@@ -967,6 +991,7 @@ func _refresh_inspector() -> void:
 		"editable": live, "path": _track_path(t), "can_remove": can_remove, "remove_tip": tip, "bake": bake,
 		"clash": SynthSongContext.clash_text(t.pattern, int(t.track_type)), "match_tip": match_tip,
 		"can_match": can_match, "selected_step": selected_step,
+		"kit_warning": SynthSongContext.kit_warning(t, tracks),
 		"banner": "" if live else "Read-only: the scene is not open in the editor. Use \"Open scene to edit\".",
 	})
 
@@ -981,20 +1006,20 @@ func _refresh_bake() -> void:
 	var ok := 0
 	var seen := {}
 	for t in tracks:
-		var p := t.patch
-		var path := SynthSongContext.path_of(p)
-		if p == null or path == "" or seen.has(path):
-			continue
-		seen[path] = true
-		var info := SynthBakeInfo.inspect(p, path, index)
-		_bake_infos[path] = info
-		match info.state:
-			SynthBakeInfo.State.STALE:
-				stale.append(path.get_file())
-			SynthBakeInfo.State.NONE:
-				none.append(path.get_file())
-			_:
-				ok += 1
+		for p in _track_patches(t):
+			var path := SynthSongContext.path_of(p)
+			if path == "" or seen.has(path):
+				continue
+			seen[path] = true
+			var info := SynthBakeInfo.inspect(p, path, index)
+			_bake_infos[path] = info
+			match info.state:
+				SynthBakeInfo.State.STALE:
+					stale.append(path.get_file())
+				SynthBakeInfo.State.NONE:
+					none.append(path.get_file())
+				_:
+					ok += 1
 	var text := ""
 	var col := SynthRackStyle.dim(self)
 	var tip := PackedStringArray()
@@ -1020,6 +1045,15 @@ func _refresh_bake() -> void:
 	_bake_label.text = text
 	_bake_label.add_theme_color_override("font_color", col)
 	_bake_chip.tooltip_text = "\n".join(tip)
+
+# The patches a track plays: its kit's pieces' when it plays a kit, else its own.
+static func _track_patches(t: MusicTrack) -> Array[SynthPatch]:
+	if t.uses_kit():
+		return t.kit.get_patches()
+	var out: Array[SynthPatch] = []
+	if t.patch != null:
+		out.append(t.patch)
+	return out
 
 # ---------------------------------------------------------------------------
 # Selecting
@@ -1126,7 +1160,8 @@ func _apply_audibility(push: bool) -> void:
 func _lane_spec(i: int) -> Dictionary:
 	var t := tracks[i]
 	return {"pattern": t.pattern, "type": int(t.track_type), "patch": t.patch, "channel": t.synth_channel,
-			"base_octave": t.base_octave, "pan": t.pan, "audible": is_audible(i)}
+			"base_octave": t.base_octave, "pan": t.pan, "audible": is_audible(i),
+			"kit": t.kit if t.uses_kit() else null, "kit_key": t.kit.signature() if t.uses_kit() else ""}
 
 ## Play every lane together, from the playhead.
 func start_song() -> void:
@@ -1469,6 +1504,153 @@ func save_chain_to(i: int, path: String) -> bool:
 		ei.call("set_object_edited", saved, false)
 	var t := tracks[i]
 	_edit.set_properties("Save chain", t, [[t, &"pattern", saved]])
+	_merge_key = ""
+	refresh(true)
+	return true
+
+# ---------------------------------------------------------------------------
+# Editing kits (the SynthKit a Drum track plays)
+#
+# Like the chain edits: every change is one action in the scene's history with the
+# TRACK as its context, whether the kit is inline in the scene or a .tres of its
+# own. A piece's own property is set on the piece; adding, removing or moving
+# pieces replaces the kit's pieces with a modified copy (they sit on channel + n,
+# so moving one changes its channel).
+# ---------------------------------------------------------------------------
+
+const PIECE_PROPS := {&"name": "name", &"note": "note", &"patch": "patch", &"pitch": "pitch", &"gain": "gain", &"pan": "pan"}
+
+## The kit lane [param i] holds, or null.
+func kit_of(i: int) -> SynthKit:
+	return tracks[i].kit if i >= 0 and i < tracks.size() else null
+
+# One action on lane [param i]'s track. [param merge_key] non-empty: fold into the
+# previous action if it had the same key (spin box clicks on one property).
+func _kit_edit(label: String, i: int, changes: Array, merge_key: String = "") -> bool:
+	var kit := kit_of(i)
+	if not live or kit == null:
+		_refresh_inspector()   # a read-only panel snaps back to what the kit holds
+		return false
+	_edit.set_properties(label, tracks[i], changes, merge_key != "" and merge_key == _merge_key, [kit])
+	_merge_key = merge_key
+	# A kit in a file of its own is changed, and not saved yet.
+	var ei := _editor_interface()
+	if ei != null and SynthSongContext.path_of(kit) != "":
+		ei.call("set_object_edited", kit, true)
+	refresh(true)
+	return true
+
+## Set [param prop] (name, note, patch, pitch, gain, pan) of piece [param piece] of
+## lane [param i]'s kit, as one undo action. [param merge] folds consecutive edits
+## of the same property (spin box clicks) into one.
+func set_piece_property(i: int, piece: int, prop: StringName, value: Variant, merge: bool = false) -> bool:
+	var kit := kit_of(i)
+	if not live or kit == null or piece < 0 or piece >= kit.pieces.size() or kit.pieces[piece] == null \
+			or not PIECE_PROPS.has(prop):
+		_refresh_inspector()
+		return false
+	var pc := kit.pieces[piece]
+	if pc.get(prop) == value:
+		return true
+	return _kit_edit("Set kit piece %d %s" % [piece + 1, PIECE_PROPS[prop]], i, [[pc, prop, value]],
+			"%s|kit%d|%s" % [_track_path(tracks[i]), piece, prop] if merge else "")
+
+# Replace lane [param i]'s kit pieces.
+func _set_pieces(label: String, i: int, arr: Array[SynthKitPiece]) -> bool:
+	var kit := kit_of(i)
+	if not live or kit == null:
+		_refresh_inspector()
+		return false
+	return _kit_edit(label, i, [[kit, &"pieces", arr]])
+
+## Add a piece at the end of lane [param i]'s kit: the first note from 36 up that no
+## piece plays, with the patch of the piece before it (else the track's).
+func add_kit_piece(i: int) -> bool:
+	var kit := kit_of(i)
+	if kit == null:
+		return false
+	var used := {}
+	for p in kit.pieces:
+		if p != null:
+			used[p.note] = true
+	var note := 36
+	while used.has(note) and note < 127:
+		note += 1
+	var arr: Array[SynthKitPiece] = kit.pieces.duplicate()
+	var patch: SynthPatch = tracks[i].patch
+	if not arr.is_empty() and arr[arr.size() - 1] != null:
+		patch = arr[arr.size() - 1].patch
+	arr.append(SynthKitPiece.create("", note, patch))
+	return _set_pieces("Add kit piece", i, arr)
+
+## Remove piece [param piece] of lane [param i]'s kit (the ones after it move down a channel).
+func remove_kit_piece(i: int, piece: int) -> bool:
+	var kit := kit_of(i)
+	if kit == null or piece < 0 or piece >= kit.pieces.size():
+		return false
+	var arr: Array[SynthKitPiece] = kit.pieces.duplicate()
+	arr.remove_at(piece)
+	return _set_pieces("Remove kit piece", i, arr)
+
+## Move piece [param piece] of lane [param i]'s kit one place earlier (-1) or later (1).
+func move_kit_piece(i: int, piece: int, dir: int) -> bool:
+	var kit := kit_of(i)
+	var to := piece + dir
+	if kit == null or piece < 0 or piece >= kit.pieces.size() or to < 0 or to >= kit.pieces.size():
+		return false
+	var arr: Array[SynthKitPiece] = kit.pieces.duplicate()
+	var moved := arr[piece]
+	arr.remove_at(piece)
+	arr.insert(to, moved)
+	return _set_pieces("Move kit piece", i, arr)
+
+## Open the patch of piece [param piece] of lane [param i]'s kit in Sound.
+func open_piece_patch(i: int, piece: int) -> void:
+	var kit := kit_of(i)
+	if kit == null or piece < 0 or piece >= kit.pieces.size() or kit.pieces[piece] == null or kit.pieces[piece].patch == null:
+		return
+	patch_requested.emit(kit.pieces[piece].patch)
+
+func _on_piece_action(action: StringName, piece: int) -> void:
+	var i := _selected_index()
+	match action:
+		&"add":
+			add_kit_piece(i)
+		&"remove":
+			remove_kit_piece(i, piece)
+		&"up":
+			move_kit_piece(i, piece, -1)
+		&"down":
+			move_kit_piece(i, piece, 1)
+		&"open":
+			open_piece_patch(i, piece)
+
+## The kit [method make_kit] would give lane [param i]: a piece for each note the
+## pattern plays (lowest first), each with the track's patch and the General MIDI
+## name of its note; one piece on note 36 when the pattern has no notes.
+func build_kit_for(i: int) -> SynthKit:
+	var t := tracks[i]
+	var notes: Array[int] = []
+	if t.pattern != null:
+		for n in t.pattern.get_play_notes():
+			if not notes.has(n.index):
+				notes.append(n.index)
+	if notes.is_empty():
+		notes.append(36)
+	notes.sort()
+	var kit := SynthKit.make_default()
+	for n in notes:
+		kit.pieces.append(SynthKitPiece.create(SynthPitchMap.GM_DRUMS.get(n, ""), n, t.patch))
+	return kit
+
+## Give lane [param i] (a Drum track with no kit) an inline kit built from its
+## pattern and patch (see [method build_kit_for]), as one undo action. The track
+## sounds as it did: each piece plays the same patch at its own note.
+func make_kit(i: int) -> bool:
+	if not live or i < 0 or i >= tracks.size() or tracks[i].track_type != MusicTrack.TrackType.DRUM or tracks[i].kit != null:
+		return false
+	var t := tracks[i]
+	_edit.set_properties("Make kit", t, [[t, &"kit", build_kit_for(i)]])
 	_merge_key = ""
 	refresh(true)
 	return true

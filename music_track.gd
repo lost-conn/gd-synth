@@ -18,6 +18,10 @@ extends Node
 #   MELODY — 0-based scale degree (accidental adds ± semitones)
 #   DRUM   — absolute MIDI note number (no transposition)
 #
+# A DRUM track may play a [SynthKit] ([member kit]) instead of one patch: each
+# row of the pattern is routed to the kit piece that owns that row, and piece i
+# plays on channel synth_channel + i with its own patch, pitch, gain and pan.
+#
 # SFX overrides:
 #   bpm_override > 0         — use own local clock at that BPM (ignore director)
 #   key_override != null     — resolve pitches against this block (ignore director)
@@ -34,9 +38,20 @@ enum TrackType { CHORD, MELODY, DRUM }
 ## already occupies the channel.
 @export var patch: SynthPatch
 
+## A drum kit: one patch per drum, played from this track's single DRUM
+## pattern. Used only when [member track_type] is DRUM and the kit has pieces;
+## then [member patch] is ignored and piece i of the kit plays on channel
+## [member synth_channel] + i, so the kit occupies synth_channel ..
+## synth_channel + pieces - 1 (a warning says so if that runs past channel 15;
+## the pieces beyond it are silent). A pattern row that no piece owns is
+## silent. Every piece channel gets this track's [member output_bus] and
+## [member effects]; a note's pan is [member pan] plus the piece's.
+@export var kit: SynthKit
+
 ## SynthEngine channel (0..15) this track targets. Multiple tracks may
 ## share a channel — they cooperate on patch/pattern but the last one to
-## activate wins the effect chain.
+## activate wins the effect chain. A track with a [member kit] starts its
+## channels here.
 @export_range(0, 15) var synth_channel: int = 0
 
 ## Octave offset for CHORD/MELODY tracks. Ignored for DRUM.
@@ -128,10 +143,11 @@ var _activated_at_beat: float = 0.0
 # bpm_override > 0.
 var _local_time: float = 0.0
 var _prev_cursor: float = -0.001
-# Each entry: {"midi": int, "off_time": float} (off_time in effective beats)
+# Each entry: {"midi": int, "channel": int, "off_time": float} (off_time in
+# effective beats)
 var _active_notes: Array = []
-# Each entry: {"midi": int, "fire_beat": float, "target_freq": float,
-# "glide_beats": float}. Bends pulled from triggered notes' bend chains;
+# Each entry: {"midi": int, "channel": int, "fire_beat": float, "target_freq":
+# float, "glide_beats": float}. Bends pulled from triggered notes' bend chains;
 # fire when effective >= fire_beat, then dispatched to SynthEngine.bend_to.
 # Cancelled on note-off, _release_all, and block changes.
 var _pending_bends: Array = []
@@ -185,8 +201,7 @@ func _wire_signals() -> void:
 func activate() -> void:
 	if synth == null:
 		return
-	if patch != null:
-		synth.set_patch(synth_channel, patch)
+	apply_patches()
 	_configure_bus()
 	_active = true
 	# Force _process to re-initialize cursor + activation offset on the
@@ -226,11 +241,73 @@ func play_once() -> void:
 	if token == _play_once_token:
 		deactivate()
 
-## Swap the patch on this track's channel. No effect on pattern state.
+## Swap the patch on this track's channel. No effect on pattern state. A track
+## that plays a kit keeps its pieces' patches (see [method swap_kit]).
 func swap_patch(new_patch: SynthPatch) -> void:
 	patch = new_patch
-	if synth != null and new_patch != null:
+	if synth == null:
+		return
+	if uses_kit():
+		apply_patches()
+	elif new_patch != null:
 		synth.set_patch(synth_channel, new_patch)
+
+## Swap the kit: its pieces' patches go on their channels and the bus and effects
+## on each of them. Ongoing notes are released. No effect on pattern state.
+func swap_kit(new_kit: SynthKit) -> void:
+	_release_all()
+	kit = new_kit
+	if synth != null:
+		apply_patches()
+		if _active:
+			_configure_bus()
+
+## True when this track plays [member kit]: a DRUM track whose kit has pieces.
+func uses_kit() -> bool:
+	return track_type == TrackType.DRUM and kit != null and not kit.pieces.is_empty()
+
+## The channels the kit occupies, as [first, last] (last may be above 15), or an
+## empty array when the track plays no kit.
+func get_kit_channels() -> Array[int]:
+	var out: Array[int] = []
+	if uses_kit():
+		out.append(synth_channel)
+		out.append(synth_channel + kit.pieces.size() - 1)
+	return out
+
+## What is wrong with the kit's channel range, or "": it must fit in channels
+## 0..[constant SynthEngine.CHANNEL_COUNT] - 1.
+func get_kit_warning() -> String:
+	if not uses_kit():
+		return ""
+	var last: int = synth_channel + kit.pieces.size() - 1
+	if last < SynthEngine.CHANNEL_COUNT:
+		return ""
+	return "The kit has %d pieces, so it needs channels %d to %d, but the synth only has channels 0 to %d. Only the first %d pieces play." % [
+			kit.pieces.size(), synth_channel, last, SynthEngine.CHANNEL_COUNT - 1, SynthEngine.CHANNEL_COUNT - synth_channel]
+
+# The channel a kit piece plays on, or -1 when it does not fit.
+func _piece_channel(i: int) -> int:
+	var ch: int = synth_channel + i
+	return ch if ch < SynthEngine.CHANNEL_COUNT else -1
+
+## Put the patch (or each kit piece's patch) on its channel(s). [method activate]
+## does this; call it yourself to pre-bind a track that is not active yet.
+func apply_patches() -> void:
+	if synth == null:
+		return
+	if not uses_kit():
+		if patch != null:
+			synth.set_patch(synth_channel, patch)
+		return
+	var warning := get_kit_warning()
+	if warning != "":
+		push_warning("[MusicTrack] %s: %s" % [name, warning])
+	for i in kit.pieces.size():
+		var ch := _piece_channel(i)
+		var piece: SynthKitPiece = kit.pieces[i]
+		if ch >= 0 and piece != null and piece.patch != null:
+			synth.set_patch(ch, piece.patch)
 
 ## Swap the pattern, optionally with a different transition mode.
 ## Default uses [member swap_mode]. Ongoing notes are released so the
@@ -256,6 +333,12 @@ func _configure_bus() -> void:
 	# saves the project's bus layout). The preview plays dry on Master and must
 	# not add auto-buses to it.
 	if Engine.is_editor_hint():
+		return
+	if uses_kit():
+		for i in kit.pieces.size():
+			var ch := _piece_channel(i)
+			if ch >= 0:
+				synth.ensure_channel_bus(ch, effects, output_bus)
 		return
 	synth.ensure_channel_bus(synth_channel, effects, output_bus)
 
@@ -296,8 +379,9 @@ func _process(delta: float) -> void:
 	while i >= 0:
 		var entry: Dictionary = _active_notes[i]
 		if effective >= entry["off_time"]:
-			synth.note_off(synth_channel, entry["midi"])
-			_cancel_pending_bends(entry["midi"])
+			var off_ch: int = entry.get("channel", synth_channel)
+			synth.note_off(off_ch, entry["midi"])
+			_cancel_pending_bends(entry["midi"], off_ch)
 			_active_notes.remove_at(i)
 		i -= 1
 
@@ -311,7 +395,7 @@ func _process(delta: float) -> void:
 				var glide_seconds: float = 0.0
 				if bpm > 0.0:
 					glide_seconds = float(be["glide_beats"]) * 60.0 / bpm
-				synth.bend_to(synth_channel, int(be["midi"]),
+				synth.bend_to(int(be.get("channel", synth_channel)), int(be["midi"]),
 					float(be["target_freq"]), glide_seconds)
 				_pending_bends.remove_at(bi)
 			bi -= 1
@@ -420,36 +504,58 @@ func _sync_cursor_to_now() -> void:
 # ---------------------------------------------------------------------------
 
 func _trigger_note(note: PatternNote, effective_beats: float) -> void:
+	if uses_kit():
+		_trigger_kit_note(note, effective_beats)
+		return
 	var midi_float: float = _resolve_midi_float(note.index, note.octave, note.accidental)
 	var midi_handle: int = roundi(midi_float)
 	synth.note_on(synth_channel, midi_float, clampf(note.velocity * velocity_scale, 0.0, 1.0), pan)
-	_active_notes.append({"midi": midi_handle, "off_time": effective_beats + note.duration})
+	_active_notes.append({"midi": midi_handle, "channel": synth_channel, "off_time": effective_beats + note.duration})
 	if not note.bends.is_empty():
-		_schedule_bends(midi_handle, effective_beats, note.bends, 0.0)
+		_schedule_bends(midi_handle, synth_channel, effective_beats, note.bends, 0.0, 0.0)
+
+# A DRUM note on a kit: the row picks the piece, the piece's channel, patch pitch,
+# gain and pan play it. A row no piece owns is silent.
+func _trigger_kit_note(note: PatternNote, effective_beats: float) -> void:
+	var i: int = kit.piece_for_note(note.index)
+	if i < 0:
+		return
+	var ch := _piece_channel(i)
+	if ch < 0:
+		return
+	var piece: SynthKitPiece = kit.pieces[i]
+	var pitch: int = piece.get_pitch()
+	synth.note_on(ch, float(pitch), piece.scale_velocity(note.velocity * velocity_scale), piece.combined_pan(pan))
+	_active_notes.append({"midi": pitch, "channel": ch, "off_time": effective_beats + note.duration})
+	if not note.bends.is_empty():
+		# A bend aims at an absolute note, so it moves with the piece's pitch.
+		_schedule_bends(pitch, ch, effective_beats, note.bends, 0.0, float(pitch - piece.note))
 
 ## Append every bend in [param bends] (and their nested children) to
 ## [_pending_bends] with absolute fire beats. [param parent_offset] is the
 ## accumulated offset of this bend's parent within the bend chain — child
 ## bends fire at parent_start_beat + parent_offset + bend.offset_beats,
 ## so each nested bend's offset_beats stays "relative to its own parent".
-func _schedule_bends(midi_handle: int, parent_start_beat: float, bends: Array[PatternBend], parent_offset: float) -> void:
+func _schedule_bends(midi_handle: int, channel: int, parent_start_beat: float, bends: Array[PatternBend],
+		parent_offset: float, pitch_shift: float) -> void:
 	for b in bends:
 		var fire_beat: float = parent_start_beat + parent_offset + b.offset_beats
-		var target_midi: float = _resolve_midi_float(b.index, b.octave, b.accidental)
+		var target_midi: float = _resolve_midi_float(b.index, b.octave, b.accidental) + pitch_shift
 		var target_freq: float = 440.0 * pow(2.0, (target_midi - 69.0) / 12.0)
 		_pending_bends.append({
 			"midi": midi_handle,
+			"channel": channel,
 			"fire_beat": fire_beat,
 			"target_freq": target_freq,
 			"glide_beats": b.glide_beats,
 		})
 		if not b.bends.is_empty():
-			_schedule_bends(midi_handle, parent_start_beat, b.bends, parent_offset + b.offset_beats)
+			_schedule_bends(midi_handle, channel, parent_start_beat, b.bends, parent_offset + b.offset_beats, pitch_shift)
 
-func _cancel_pending_bends(midi_handle: int) -> void:
+func _cancel_pending_bends(midi_handle: int, channel: int) -> void:
 	var i: int = _pending_bends.size() - 1
 	while i >= 0:
-		if int(_pending_bends[i]["midi"]) == midi_handle:
+		if int(_pending_bends[i]["midi"]) == midi_handle and int(_pending_bends[i].get("channel", synth_channel)) == channel:
 			_pending_bends.remove_at(i)
 		i -= 1
 
@@ -518,6 +624,6 @@ func _release_all() -> void:
 	if synth == null:
 		return
 	for entry in _active_notes:
-		synth.note_off(synth_channel, entry["midi"])
+		synth.note_off(entry.get("channel", synth_channel), entry["midi"])
 	_active_notes.clear()
 	_pending_bends.clear()

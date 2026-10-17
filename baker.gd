@@ -39,6 +39,11 @@ static var last_stats: Dictionary = {}
 class TrackInfo:
 	var pattern: MusicPattern
 	var patch: SynthPatch
+	## A drum kit (DRUM tracks only; null for a track that plays [member patch]).
+	## Piece i plays on channel (channel + i): each row of the pattern goes to the
+	## piece that owns it, at the piece's pitch and with its gain and pan, and the
+	## piece's patch takes the place of [member patch].
+	var kit: SynthKit
 	var track_type: int = MusicTrack.TrackType.MELODY
 	var channel: int = 0
 	var base_octave: int = 4
@@ -65,6 +70,7 @@ static func collect_song(root: Node, swing: float = 0.0) -> Dictionary:
 			var info := TrackInfo.new()
 			info.pattern = t.pattern
 			info.patch = t.patch
+			info.kit = t.kit if t.uses_kit() else null
 			info.track_type = int(t.track_type)
 			info.channel = t.synth_channel
 			info.base_octave = t.base_octave
@@ -99,7 +105,12 @@ static func bake_song(data: MusicData, tracks: Array, swing: float = 0.0,
 	for info in tracks:
 		if info == null or info.pattern == null or info.pattern.get_play_length() <= 0.0:
 			continue
-		if info.channel >= 0 and info.channel < 16:
+		if info.kit != null and info.track_type == MusicTrack.TrackType.DRUM:
+			for i in info.kit.pieces.size():
+				var ch: int = info.channel + i
+				if ch >= 0 and ch < 16 and info.kit.pieces[i] != null:
+					patches[ch] = info.kit.pieces[i].patch
+		elif info.channel >= 0 and info.channel < 16:
 			patches[info.channel] = info.patch
 		_flatten_track(events, info, data, loop_beats, swing, spb, bpm)
 
@@ -161,6 +172,7 @@ static func _flatten_track(events: Array, info: TrackInfo, data: MusicData,
 		loop_beats: float, swing: float, spb: float, bpm: float) -> void:
 	var length: float = info.pattern.get_play_length()
 	var reps: int = int(round(loop_beats / length))
+	var kit: SynthKit = info.kit if info.track_type == MusicTrack.TrackType.DRUM else null
 	for rep in reps:
 		var base_beat: float = rep * length
 		for note in info.pattern.get_play_notes():
@@ -169,6 +181,9 @@ static func _flatten_track(events: Array, info: TrackInfo, data: MusicData,
 			if fire_beat >= loop_beats - 1e-6:
 				continue  # belongs to the next loop iteration
 			var block := _block_at(data, fire_beat)
+			if kit != null:
+				_flatten_kit_note(events, info, kit, note, block, fire_beat, spb)
+				continue
 			var midi: float = _resolve(info.track_type, block, info.base_octave,
 				note.index, note.octave, note.accidental)
 			var handle: int = roundi(midi)
@@ -179,18 +194,40 @@ static func _flatten_track(events: Array, info: TrackInfo, data: MusicData,
 			if not note.bends.is_empty():
 				_flatten_bends(events, info, block, handle, note.bends, fire_beat, 0.0, spb)
 
+# One DRUM note of a kit track: the row picks the piece; a row no piece owns (or
+# one whose channel does not exist) is dropped, as MusicTrack drops it live.
+static func _flatten_kit_note(events: Array, info: TrackInfo, kit: SynthKit, note: PatternNote,
+		block: MusicBlock, fire_beat: float, spb: float) -> void:
+	var i: int = kit.piece_for_note(note.index)
+	if i < 0:
+		return
+	var ch: int = info.channel + i
+	if ch < 0 or ch >= 16:
+		return
+	var piece: SynthKitPiece = kit.pieces[i]
+	var pitch: int = piece.get_pitch()
+	events.append([fire_beat * spb, SynthEngine.CMD_NOTE_ON, ch, float(pitch),
+		piece.scale_velocity(note.velocity), piece.combined_pan(info.pan)])
+	events.append([(fire_beat + note.duration) * spb, SynthEngine.CMD_NOTE_OFF, ch, pitch])
+	if not note.bends.is_empty():
+		_flatten_bends(events, info, block, pitch, note.bends, fire_beat, 0.0, spb, ch, float(pitch - piece.note))
+
+# [param channel] -1: the track's own. [param pitch_shift] moves a bend's target
+# (a kit piece played at another pitch than its row).
 static func _flatten_bends(events: Array, info: TrackInfo, block: MusicBlock,
-		handle: int, bends: Array, parent_start: float, parent_offset: float, spb: float) -> void:
+		handle: int, bends: Array, parent_start: float, parent_offset: float, spb: float,
+		channel: int = -1, pitch_shift: float = 0.0) -> void:
+	var ch: int = channel if channel >= 0 else info.channel
 	for b in bends:
 		var fire: float = parent_start + parent_offset + b.offset_beats
 		var target_midi: float = _resolve(info.track_type, block, info.base_octave,
-			b.index, b.octave, b.accidental)
+			b.index, b.octave, b.accidental) + pitch_shift
 		var target_freq: float = 440.0 * pow(2.0, (target_midi - 69.0) / 12.0)
-		events.append([fire * spb, SynthEngine.CMD_BEND, info.channel, handle,
+		events.append([fire * spb, SynthEngine.CMD_BEND, ch, handle,
 			target_freq, b.glide_beats * spb])
 		if not b.bends.is_empty():
 			_flatten_bends(events, info, block, handle, b.bends, parent_start,
-				parent_offset + b.offset_beats, spb)
+				parent_offset + b.offset_beats, spb, channel, pitch_shift)
 
 # ---------------------------------------------------------------------------
 # Resolution helpers (mirror MusicTrack / MusicDirector)

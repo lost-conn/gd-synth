@@ -50,6 +50,9 @@ var sampler: SynthSampler
 var audition_set: SynthSampleSet
 ## Which engine the most recent audition note went to (&"live" / &"baked" / &"none").
 var last_audition_engine: StringName = &""
+## The channel and MIDI note of the most recent kit audition ([method audition_kit_on]).
+var last_kit_channel: int = -1
+var last_kit_pitch: int = -1
 
 ## The current patch (timbre). Null plays the default organ.
 var patch: SynthPatch
@@ -68,6 +71,10 @@ var _song_on: bool = false
 var _song_audible: Array[bool] = []
 # Auditioned notes still held: midi -> the engine that started them.
 var _held: Dictionary = {}
+# Kit pieces auditioned and still held: piece index -> MIDI note.
+var _held_kit: Dictionary = {}
+# True while the preview channels hold a kit's patches rather than the shared one.
+var _kit_bound: bool = false
 var _last_playing: bool = false
 var _end_beat: float = -1.0
 var _default_data: MusicData
@@ -178,6 +185,8 @@ func shutdown() -> void:
 	synth = null
 	sampler = null
 	_held.clear()
+	_held_kit.clear()
+	_kit_bound = false
 
 func _exit_tree() -> void:
 	if synth != null:
@@ -202,6 +211,8 @@ func set_patch(p: SynthPatch) -> void:
 	if sampler != null:
 		sampler.all_notes_off()
 	_held.clear()
+	_held_kit.clear()
+	_kit_bound = false
 	patch_changed.emit(p)
 
 ## Choose the MusicData to preview. Null selects the built-in default. A change
@@ -270,6 +281,7 @@ func audition_note_on(note: int, velocity: float, baked: bool = false) -> String
 	if _suspended:
 		return &"none"
 	ensure_started()
+	_restore_shared_patch()
 	var engine: StringName = &"live"
 	if baked:
 		if audition_set == null:
@@ -300,6 +312,49 @@ func audition_note_off(note: int) -> void:
 func audition_all_off() -> void:
 	for n in _held.keys():
 		audition_note_off(n)
+	for i in _held_kit.keys():
+		audition_kit_off(i)
+
+## Start piece [param i] of [param kit] at [param velocity] on the live engine: on
+## channel CHANNEL + i, through the piece's patch, at the piece's pitch, with its
+## gain and pan, as a MusicTrack with that kit would play it. Returns &"live", or
+## &"none" when there is no such piece or its channel does not exist.
+func audition_kit_on(kit: SynthKit, i: int, velocity: float) -> StringName:
+	last_kit_channel = -1
+	last_kit_pitch = -1
+	if _suspended or kit == null or i < 0 or i >= kit.pieces.size() or kit.pieces[i] == null:
+		return &"none"
+	var ch: int = CHANNEL + i
+	if ch >= SynthEngine.CHANNEL_COUNT:
+		return &"none"
+	ensure_started()
+	var piece: SynthKitPiece = kit.pieces[i]
+	if piece.patch != null:
+		synth.set_patch(ch, piece.patch)
+		_kit_bound = true
+	var pitch: int = piece.get_pitch()
+	synth.note_on(ch, float(pitch), piece.scale_velocity(velocity), piece.combined_pan(0.0))
+	_held_kit[i] = pitch
+	last_kit_channel = ch
+	last_kit_pitch = pitch
+	last_audition_engine = &"live"
+	audition_played.emit(&"live", pitch)
+	return &"live"
+
+## Release a note started by [method audition_kit_on].
+func audition_kit_off(i: int) -> void:
+	if not _held_kit.has(i):
+		return
+	var pitch: int = _held_kit[i]
+	_held_kit.erase(i)
+	if synth != null:
+		synth.note_off(CHANNEL + i, pitch)
+
+# Put the shared patch back on the preview channel, after a kit used it.
+func _restore_shared_patch() -> void:
+	if _kit_bound and synth != null and not _suspended:
+		synth.set_patch(CHANNEL, get_effective_patch())
+	_kit_bound = false
 
 ## Notes of the audition that are still held: midi -> &"live" / &"baked".
 func get_held_auditions() -> Dictionary:
@@ -313,8 +368,10 @@ func is_playing() -> bool:
 	return director != null and director.playing
 
 ## Play [param pattern] on the preview track, through the current patch and
-## music data, from the top of the progression.
-func play_pattern(pattern: MusicPattern, track_type: int, base_octave: int) -> void:
+## music data, from the top of the progression. [param kit]: a DRUM pattern's
+## kit; each row then plays through its piece's patch (piece i on channel
+## CHANNEL + i) instead of the current one.
+func play_pattern(pattern: MusicPattern, track_type: int, base_octave: int, kit: SynthKit = null) -> void:
 	if _suspended:
 		return
 	ensure_started()
@@ -322,9 +379,11 @@ func play_pattern(pattern: MusicPattern, track_type: int, base_octave: int) -> v
 	track.track_type = track_type
 	track.pattern = pattern
 	track.patch = get_effective_patch()
+	track.kit = kit
 	track.synth_channel = CHANNEL
 	track.base_octave = base_octave
 	synth.set_patch(CHANNEL, get_effective_patch())
+	_kit_bound = track.uses_kit()
 	track.activate()
 	var data: MusicData = get_effective_music_data()
 	director.data = data
@@ -341,6 +400,7 @@ func play_pattern(pattern: MusicPattern, track_type: int, base_octave: int) -> v
 ##
 ## A lane is a Dictionary: pattern (MusicPattern or null), type (MusicTrack.TrackType),
 ## patch (SynthPatch or null: the shared current patch), channel (0..15),
+## kit (SynthKit or null: a DRUM lane's kit, whose pieces take channel + i),
 ## base_octave, pan, audible (false = muted: it is built but not activated).
 ##
 ## The song tracks are the preview's own, like the single one: handed their
@@ -369,6 +429,7 @@ func play_song(lanes: Array, start_beat: float = 0.0) -> void:
 		t.synth_channel = clampi(int(spec.get("channel", 0)), 0, 15)
 		t.base_octave = int(spec.get("base_octave", 4))
 		t.pan = float(spec.get("pan", 0.0))
+		t.kit = spec.get("kit")
 		t.swap_mode = MusicDirector.SwapMode.IMMEDIATE
 		# From the top, a lane starts its pattern the moment it is activated; from
 		# the middle it has to follow the director's position.
@@ -381,7 +442,7 @@ func play_song(lanes: Array, start_beat: float = 0.0) -> void:
 	var data: MusicData = get_effective_music_data()
 	director.data = data
 	for i in song_tracks.size():
-		synth.set_patch(song_tracks[i].synth_channel, song_tracks[i].patch)
+		song_tracks[i].apply_patches()
 		if _song_audible[i]:
 			song_tracks[i].activate()
 	_end_beat = _one_shot_end_beat(data, longest)
@@ -420,9 +481,10 @@ func update_song_lane(i: int, spec: Dictionary) -> void:
 	t.synth_channel = clampi(int(spec.get("channel", 0)), 0, 15)
 	t.base_octave = int(spec.get("base_octave", 4))
 	t.pan = float(spec.get("pan", 0.0))
+	t.kit = spec.get("kit")
 	_song_audible[i] = bool(spec.get("audible", true))
 	if synth != null and not _suspended:
-		synth.set_patch(t.synth_channel, t.patch)
+		t.apply_patches()
 	if _song_audible[i]:
 		t.sync_to_director = true
 		t.activate()
@@ -477,6 +539,8 @@ func stop() -> void:
 	if sampler != null:
 		sampler.all_notes_off()
 	_held.clear()
+	_held_kit.clear()
+	_restore_shared_patch()
 	_sync_playing()
 
 func _process(_delta: float) -> void:

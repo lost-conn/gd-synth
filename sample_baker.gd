@@ -185,9 +185,14 @@ class Settings:
 
 ## Add every note [param info] (a [SynthBaker.TrackInfo]) plays over one loop of
 ## [param data] — a director-driven track, resolved block by block as
-## [SynthBaker] flattens it.
+## [SynthBaker] flattens it. A track that plays a kit has one patch per piece, so
+## its notes belong in several usages: use [method add_track_usage_routed] (this
+## one adds nothing for a kit track).
 static func add_track_usage(usage: Usage, info, data: MusicData, swing: float = 0.0) -> void:
 	if info == null or info.pattern == null or info.pattern.get_play_length() <= 0.0:
+		return
+	if _kit_of(info) != null:
+		push_warning("[SynthSampleBaker] add_track_usage does not take a kit track: use add_track_usage_routed.")
 		return
 	if data == null or data.blocks.is_empty():
 		return
@@ -199,6 +204,69 @@ static func add_track_usage(usage: Usage, info, data: MusicData, swing: float = 
 			var fire: float = rep * length + fposmod(SynthBaker._swung(note.beat, swing), length)
 			var block := SynthBaker._block_at(data, fire)
 			_add_note_usage(usage, note, info.track_type, info.base_octave, block, spb)
+
+## [method add_track_usage] for a track that may play a kit. [param usage_for] is
+## a Callable taking a [SynthPatch] and returning the [Usage] to add that patch's
+## notes to (it may create the usage on first sight). A plain track adds all its
+## notes to [code]usage_for(info.patch)[/code]; a kit track adds each piece's notes
+## to [code]usage_for(piece.patch)[/code], at the piece's pitch and with its gain
+## applied to the velocity, as [SynthBaker] renders them. Rows no piece owns and
+## pieces without a patch add nothing.
+static func add_track_usage_routed(info, data: MusicData, swing: float, usage_for: Callable) -> void:
+	if info == null or info.pattern == null or info.pattern.get_play_length() <= 0.0:
+		return
+	if data == null or data.blocks.is_empty():
+		return
+	var kit: SynthKit = _kit_of(info)
+	if kit == null:
+		if info.patch != null:
+			add_track_usage(usage_for.call(info.patch), info, data, swing)
+		return
+	var spb: float = 60.0 / (data.bpm if data.bpm > 0.0 else 120.0)
+	var loop_beats: float = SynthBaker._loop_beats(data, [info])
+	var length: float = info.pattern.get_play_length()
+	var usages: Dictionary = {}  # piece index -> Usage
+	for rep in int(round(loop_beats / length)):
+		for note in info.pattern.get_play_notes():
+			var i: int = kit.piece_for_note(note.index)
+			if i < 0 or kit.pieces[i].patch == null or info.channel + i >= 16:
+				continue
+			if not usages.has(i):
+				usages[i] = usage_for.call(kit.pieces[i].patch)
+			var piece: SynthKitPiece = kit.pieces[i]
+			var pitch: float = float(piece.get_pitch())
+			var usage: Usage = usages[i]
+			usage.add_note(pitch, piece.scale_velocity(note.velocity), note.duration * spb)
+			_add_bend_usage(usage, pitch, note.bends, MusicTrack.TrackType.DRUM, info.base_octave, null,
+					float(piece.get_pitch() - piece.note))
+
+# The kit a track info plays, or null (not a DRUM track, or no kit).
+static func _kit_of(info) -> SynthKit:
+	var kit: Variant = info.get("kit")
+	if kit is SynthKit and int(info.track_type) == MusicTrack.TrackType.DRUM:
+		return kit
+	return null
+
+## [method add_pattern_usage] for a free-running DRUM pattern played through a
+## [SynthKit]: each piece's notes go to [code]usage_for(piece.patch)[/code] (see
+## [method add_track_usage_routed]), at the piece's pitch and gain. [param bpm] is
+## the slowest tempo the pattern is played at.
+static func add_kit_pattern_usage(pattern: MusicPattern, kit: SynthKit, bpm: float, usage_for: Callable) -> void:
+	if pattern == null or kit == null:
+		return
+	var spb: float = 60.0 / maxf(bpm, 1.0)
+	var usages: Dictionary = {}  # piece index -> Usage
+	for note in pattern.get_play_notes():
+		var i: int = kit.piece_for_note(note.index)
+		if i < 0 or kit.pieces[i].patch == null:
+			continue
+		if not usages.has(i):
+			usages[i] = usage_for.call(kit.pieces[i].patch)
+		var piece: SynthKitPiece = kit.pieces[i]
+		var pitch: float = float(piece.get_pitch())
+		var usage: Usage = usages[i]
+		usage.add_note(pitch, piece.scale_velocity(note.velocity), note.duration * spb)
+		_add_bend_usage(usage, pitch, note.bends, MusicTrack.TrackType.DRUM, 4, null, float(piece.get_pitch() - piece.note))
 
 ## Add every note of a free-running pattern (an SFX on its own
 ## [member MusicTrack.bpm_override] clock). CHORD / MELODY pitches are resolved
@@ -224,11 +292,11 @@ static func _add_note_usage(usage: Usage, note: PatternNote, track_type: int,
 	_add_bend_usage(usage, midi, note.bends, track_type, base_octave, block)
 
 static func _add_bend_usage(usage: Usage, midi: float, bends: Array, track_type: int,
-		base_octave: int, block: MusicBlock) -> void:
+		base_octave: int, block: MusicBlock, pitch_shift: float = 0.0) -> void:
 	for b in bends:
-		usage.add_bend(midi, _resolve(track_type, block, base_octave, b.index, b.octave, b.accidental))
+		usage.add_bend(midi, _resolve(track_type, block, base_octave, b.index, b.octave, b.accidental) + pitch_shift)
 		if not b.bends.is_empty():
-			_add_bend_usage(usage, midi, b.bends, track_type, base_octave, block)
+			_add_bend_usage(usage, midi, b.bends, track_type, base_octave, block, pitch_shift)
 
 # SynthBaker._resolve, tolerating the null block a track resolves to 60 against.
 static func _resolve(track_type: int, block: MusicBlock, base_octave: int,

@@ -103,6 +103,21 @@ static func midi_to_row(type: int, midi: float, base_octave: int, block: MusicBl
 # Row labels
 # ---------------------------------------------------------------------------
 
+## What a kit piece is called: its name, else the General MIDI drum or note name
+## of its note ("Closed hat", "G3").
+static func piece_name(piece: SynthKitPiece) -> String:
+	if piece == null:
+		return ""
+	if piece.name != "":
+		return piece.name
+	return String(GM_DRUMS[piece.note]) if GM_DRUMS.has(piece.note) else note_name(piece.note)
+
+## Row label of a drum row in a kit: "36 Kick" with the piece's name, or "" when
+## no piece plays the row.
+static func kit_label(kit: SynthKit, midi: int) -> String:
+	var piece: SynthKitPiece = kit.get_piece_for_note(midi) if kit != null else null
+	return "%d %s" % [midi, piece_name(piece)] if piece != null else ""
+
 ## Drum row label: "36 Kick", or the note name where General MIDI has no drum.
 static func drum_label(midi: int) -> String:
 	if GM_DRUMS.has(midi):
@@ -113,10 +128,11 @@ static func note_name(midi: int) -> String:
 	return "%s%d" % [NOTE_NAMES[posmod(midi, 12)], floori(midi / 12.0) - 1]
 
 ## Label of [param row] for a roll of [param type] with [param rpo] rows per octave.
-static func row_label(type: int, row: int, rpo: int) -> String:
+static func row_label(type: int, row: int, rpo: int, kit: SynthKit = null) -> String:
 	match type:
 		MusicTrack.TrackType.DRUM:
-			return drum_label(row)
+			var named := kit_label(kit, row)
+			return named if named != "" else drum_label(row)
 		MusicTrack.TrackType.MELODY:
 			var oct := floori(float(row) / float(rpo))
 			var d := posmod(row, rpo)

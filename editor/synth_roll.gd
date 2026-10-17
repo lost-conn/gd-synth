@@ -99,6 +99,25 @@ var track_type: int = MusicTrack.TrackType.CHORD:
 		queue_redraw()
 		view_changed.emit()
 
+## The drum kit of the track that plays the pattern (null for none). With a
+## DRUM track type its pieces name their rows and the rows are always shown,
+## empty or not, so notes can be drawn into them.
+var kit: SynthKit:
+	set(value):
+		kit = value
+		if _kit_sig == _kit_signature():
+			return
+		_kit_sig = _kit_signature()
+		_range_set = false
+		_recompute_range()
+		queue_redraw()
+		view_changed.emit()
+
+var _kit_sig: String = ""
+
+func _kit_signature() -> String:
+	return "" if kit == null else kit.signature()
+
 ## Rows per octave of the chord / scale (3 and 7 unless the progression says otherwise).
 var rows_per_octave: int = 3:
 	set(value):
@@ -353,6 +372,11 @@ func _recompute_range(grow_only: bool = false) -> void:
 	var d := _default_range()
 	var lo := d.x
 	var hi := d.y
+	if kit != null and track_type == MusicTrack.TrackType.DRUM:
+		for piece in kit.pieces:
+			if piece != null:
+				lo = mini(lo, piece.note - ROW_MARGIN)
+				hi = maxi(hi, piece.note + ROW_MARGIN)
 	if pattern != null:
 		for n in pattern.notes:
 			var r := row_of(n.index, n.octave)
@@ -468,6 +492,10 @@ func _visible_rows() -> Vector2i:
 	var bottom := clampi(y_to_row(_area.end.y), row_lo, row_hi)
 	return Vector2i(bottom, top)
 
+## Whether [param row] is played by a piece of the kit (a DRUM roll with a kit).
+func is_kit_row(row: int) -> bool:
+	return kit != null and track_type == MusicTrack.TrackType.DRUM and kit.piece_for_note(row) >= 0
+
 func _is_root_row(row: int) -> bool:
 	if track_type == MusicTrack.TrackType.DRUM:
 		return posmod(row, 12) == 0
@@ -482,6 +510,8 @@ func _draw_rows() -> void:
 		if _is_root_row(row):
 			var strong: bool = row == 0 and track_type != MusicTrack.TrackType.DRUM
 			draw_rect(Rect2(_area.position.x, y, _area.size.x, row_height), Color(accent, 0.20 if strong else 0.09))
+		elif is_kit_row(row):
+			draw_rect(Rect2(_area.position.x, y, _area.size.x, row_height), Color(accent, 0.06))
 		draw_line(Vector2(_area.position.x, y), Vector2(_area.end.x, y), Color(grid, grid.a * 0.6), 1.0)
 	var end_x := beat_to_x(pattern.length_beats)
 	if end_x < _area.end.x:
@@ -604,9 +634,10 @@ func _draw_gutter() -> void:
 		if y + row_height < rh or y > size.y:
 			continue
 		var root := _is_root_row(row)
+		var in_kit := is_kit_row(row)
 		draw_string(_font, Vector2(6.0 * s, y + row_height * 0.5 + float(_fs) * 0.36),
-				SynthPitchMap.row_label(track_type, row, rows_per_octave), HORIZONTAL_ALIGNMENT_LEFT,
-				gw - 10.0 * s, _fs, text if root else dim)
+				SynthPitchMap.row_label(track_type, row, rows_per_octave, kit if in_kit else null), HORIZONTAL_ALIGNMENT_LEFT,
+				gw - 10.0 * s, _fs, text if (root or in_kit) else dim)
 
 func _draw_ruler() -> void:
 	var s := _s()

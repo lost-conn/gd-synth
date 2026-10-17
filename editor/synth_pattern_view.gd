@@ -380,6 +380,23 @@ func get_effective_type() -> int:
 	return _inferred.get("type", MusicTrack.TrackType.CHORD)
 
 ## Where the type came from, as the Type menu's tooltip says it.
+## The drum kit the pattern's MusicTrack plays (a DRUM track whose kit has pieces),
+## or null. Its pieces name the roll's rows and the rows are heard through their
+## patches. Read from the song context first (the Track view keeps it current),
+## then from the track the type was inferred from.
+func get_kit() -> SynthKit:
+	if pattern == null or get_effective_type() != MusicTrack.TrackType.DRUM:
+		return null
+	var track: Dictionary = {}
+	if song_context != null:
+		track = song_context.track_for(pattern)
+	if track.is_empty():
+		track = _inferred.get("track", {})
+	if track.is_empty() or int(track.get("type", -1)) != MusicTrack.TrackType.DRUM:
+		return null
+	var kit: SynthKit = track.get("kit")
+	return kit if kit != null and not kit.pieces.is_empty() else null
+
 func get_type_source() -> String:
 	return _type_opt.tooltip_text
 
@@ -662,13 +679,16 @@ func _refresh_info() -> void:
 	if not _built or pattern == null:
 		return
 	var type := get_effective_type()
+	_roll.kit = get_kit()
 	var hint := int(pattern.editor_track_type)
 	_inspector.set_type_info("%s%s. %s" % [SynthPitchMap.type_name(type), "" if hint != AUTO else " (auto)", _type_opt.tooltip_text],
 			_type_opt.tooltip_text)
 	_inspector.set_base_octave(base_octave, type != MusicTrack.TrackType.DRUM)
 	_refresh_clash()
 	var track: Dictionary = _inferred.get("track", {})
-	if not track.is_empty() and track["patch_path"] != "":
+	if _roll.kit != null:
+		_inspector.set_patch_info("Its MusicTrack plays it through a drum kit of %d pieces: each row is heard through its piece's patch, not the one above." % _roll.kit.pieces.size())
+	elif not track.is_empty() and track["patch_path"] != "":
 		_inspector.set_patch_info("Its MusicTrack plays it with %s on channel %d." % [str(track["patch_path"]).get_file(), track["channel"]])
 	elif not track.is_empty():
 		_inspector.set_patch_info("Its MusicTrack has no patch of its own.")
@@ -1016,7 +1036,7 @@ func _on_base_octave(v: int) -> void:
 	if _preview != null:
 		_preview.set_base_octave(v)
 		if _preview.is_playing():
-			_preview.play_pattern(pattern, get_effective_type(), base_octave)
+			_preview.play_pattern(pattern, get_effective_type(), base_octave, get_kit())
 	_refresh_faint()
 	_refresh_info()
 
@@ -1175,7 +1195,7 @@ func start_preview() -> void:
 	if pattern == null:
 		return
 	_ensure_preview()
-	_preview.play_pattern(pattern, get_effective_type(), base_octave)
+	_preview.play_pattern(pattern, get_effective_type(), base_octave, get_kit())
 
 func stop_preview() -> void:
 	if _preview != null:
@@ -1197,14 +1217,39 @@ func _on_seek(beat: float) -> void:
 	_playhead.queue_redraw()
 
 func _on_note_auditioned(n: PatternNote) -> void:
+	if _audition_kit_row(n.index, n.velocity):
+		return
 	_audition(n.index, n.octave, n.accidental, n.velocity, n.beat)
 
 func _on_row_auditioned(row: int) -> void:
-	var type := get_effective_type()
-	if type == MusicTrack.TrackType.DRUM:
-		_audition(row, 0, 0.0, 0.8, 0.0)
-	else:
-		_audition(row, 0, 0.0, 0.8, 0.0)
+	if _audition_kit_row(row, 0.8):
+		return
+	_audition(row, 0, 0.0, 0.8, 0.0)
+
+# A row of a kit plays through its piece's patch, at the piece's pitch. False when
+# the pattern has no kit or no piece owns the row (the row then sounds through the
+# shared patch, as before).
+func _audition_kit_row(row: int, velocity: float) -> bool:
+	var kit := get_kit()
+	if kit == null or _preview == null or not _preview.is_started() or _preview.is_suspended():
+		return false
+	var i := kit.piece_for_note(row)
+	if i < 0:
+		return false
+	if _preview.audition_kit_on(kit, i, velocity) == &"none":
+		return true
+	var ticket: int = _audition_tickets.get(row, 0) + 1
+	_audition_tickets[row] = ticket
+	var t := Timer.new()
+	t.one_shot = true
+	t.wait_time = AUDITION_SECONDS
+	t.timeout.connect(func():
+		if _audition_tickets.get(row, 0) == ticket and _preview != null and is_instance_valid(_preview):
+			_preview.audition_kit_off(i)
+		t.queue_free())
+	add_child(t)
+	t.start()
+	return true
 
 # Play one note briefly through the shared preview, resolved as the track would.
 func _audition(index_: int, octave: int, accidental: float, velocity: float, beat: float) -> void:

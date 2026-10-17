@@ -7,6 +7,8 @@ extends PanelContainer
 # an undo action on the scene's node. When the scene is not open in the editor the
 # whole panel is read-only. When the track plays a PatternChain it also lists the
 # chain's steps (pattern, repeats, octave, velocity) and the buttons that edit them.
+# A DRUM track also shows its drum kit: a Kit slot and the kit's pieces (name, note,
+# patch, pitch, gain, pan), with the buttons that add, remove, move and open them.
 
 ## [param prop] is the MusicTrack property; [param merge] true for a spin box
 ## click (consecutive ones fold into one undo step).
@@ -25,6 +27,12 @@ signal step_selected(step: int)
 signal make_chain_requested
 signal unwrap_chain_requested
 signal save_chain_requested
+## A piece of the track's kit was edited. [param prop] is the SynthKitPiece
+## property; [param merge] is true for a spin box click.
+signal piece_edited(piece: int, prop: StringName, value: Variant, merge: bool)
+## A kit button: &"add" (piece is -1), &"remove", &"up", &"down", &"open" (the piece's patch in Sound).
+signal piece_action(action: StringName, piece: int)
+signal make_kit_requested
 
 const TYPE_NAMES := ["Chord", "Melody", "Drum"]
 const SWAP_NAMES := ["Immediate", "Next beat", "Next block"]
@@ -49,6 +57,16 @@ var _add_step: Button
 var _rows: Array[Dictionary] = []
 var _selected_step: int = -1
 var _open_patch: Button
+var _patch_row: HBoxContainer
+var _kit: SynthResourceField
+var _kit_row: HBoxContainer
+var _make_kit: Button
+var _kit_box: VBoxContainer
+var _kit_info: Label
+var _kit_warn: Label
+var _piece_rows: VBoxContainer
+var _add_piece: Button
+var _pieces: Array[Dictionary] = []
 var _bake: Label
 var _channel: SpinBox
 var _octave: SpinBox
@@ -130,11 +148,32 @@ func _init() -> void:
 	_add_step = _flat_button("Add step", func(): step_action.emit(&"add", -1))
 	_steps_box.add_child(_add_step)
 
+	_kit = SynthResourceField.new()
+	_kit.setup("SynthKit")
+	_kit.resource_changed.connect(func(r: Resource): edited.emit(&"kit", r, false))
+	_kit_row = _row("Kit", _kit, "A drum kit: one patch per drum, played from this track's one pattern. Piece n plays on channel + n. While a kit has pieces, the track's own patch is not used.")
+	_make_kit = _flat_button("Make kit", func(): make_kit_requested.emit())
+	_body.add_child(_make_kit)
+	_kit_box = VBoxContainer.new()
+	_kit_box.add_theme_constant_override("separation", 6)
+	_body.add_child(_kit_box)
+	_kit_info = _wrapped()
+	_kit_box.add_child(_kit_info)
+	_kit_warn = _wrapped()
+	_kit_warn.add_theme_color_override("font_color", SynthRackStyle.warn(self))
+	_kit_warn.mouse_filter = Control.MOUSE_FILTER_STOP
+	_kit_box.add_child(_kit_warn)
+	_piece_rows = VBoxContainer.new()
+	_piece_rows.add_theme_constant_override("separation", 6)
+	_kit_box.add_child(_piece_rows)
+	_add_piece = _flat_button("Add piece", func(): piece_action.emit(&"add", -1))
+	_kit_box.add_child(_add_piece)
+
 	_patch = SynthResourceField.new()
 	_patch.setup("SynthPatch")
 	_patch.resource_changed.connect(func(r: Resource): edited.emit(&"patch", r, false))
 	_patch.resource_opened.connect(func(_r: Resource): patch_open_requested.emit())
-	_row("Patch", _patch, "The timbre this track puts on its channel.")
+	_patch_row = _row("Patch", _patch, "The timbre this track puts on its channel.")
 	_open_patch = Button.new()
 	_open_patch.text = "Open in Sound"
 	_open_patch.focus_mode = Control.FOCUS_NONE
@@ -223,7 +262,7 @@ func _spin(lo: float, hi: float, step: float) -> SpinBox:
 	sp.size_flags_horizontal = Control.SIZE_EXPAND_FILL
 	return sp
 
-func _row(text: String, control: Control, tip: String) -> void:
+func _row(text: String, control: Control, tip: String) -> HBoxContainer:
 	var row := HBoxContainer.new()
 	row.add_theme_constant_override("separation", 6)
 	_body.add_child(row)
@@ -236,6 +275,7 @@ func _row(text: String, control: Control, tip: String) -> void:
 	control.size_flags_horizontal = Control.SIZE_EXPAND_FILL
 	control.tooltip_text = tip
 	row.add_child(control)
+	return row
 
 ## Nothing to show: [param message] says why.
 func show_none(message: String) -> void:
@@ -271,9 +311,14 @@ func show_track(t: MusicTrack, info: Dictionary) -> void:
 	_open_pattern.disabled = t.pattern == null
 	_selected_step = info.get("selected_step", -1)
 	_show_chain(t.pattern)
+	var drum := t.track_type == MusicTrack.TrackType.DRUM
+	var uses_kit := t.uses_kit()
+	_patch_row.visible = not uses_kit
+	_open_patch.visible = not uses_kit
 	_patch.set_resource(t.patch)
 	_patch.editable = _editable
 	_open_patch.disabled = t.patch == null
+	_show_kit(t, info, drum, uses_kit)
 	_bake.text = info.get("bake", "")
 	_bake.visible = _bake.text != ""
 	_channel.set_value_no_signal(t.synth_channel)
@@ -333,6 +378,152 @@ func _show_chain(p: MusicPattern) -> void:
 		_rows.append(_make_step_row())
 	for i in _rows.size():
 		_sync_row(i, chain.steps[i])
+
+# The Kit slot, the Make kit button and the piece list for the track's kit.
+func _show_kit(t: MusicTrack, info: Dictionary, drum: bool, uses_kit: bool) -> void:
+	var has_kit := t.kit != null
+	_kit_row.visible = drum or has_kit
+	_kit.set_resource(t.kit)
+	_kit.editable = _editable
+	_make_kit.visible = drum and not has_kit
+	_make_kit.disabled = not _editable
+	_make_kit.tooltip_text = READONLY_TIP if not _editable else "Give this track a drum kit with a piece for each note its pattern plays, each using the track's patch (undoable). Then give the pieces other patches."
+	_kit_box.visible = has_kit
+	if not has_kit:
+		while not _pieces.is_empty():
+			var gone: PanelContainer = _pieces.pop_back()["panel"]
+			_piece_rows.remove_child(gone)
+			gone.queue_free()
+		return
+	var warn: String = info.get("kit_warning", "")
+	if not drum:
+		_kit_info.text = "Only a Drum track plays a kit: this one is ignored."
+	elif t.kit.pieces.is_empty():
+		_kit_info.text = "The kit has no pieces yet, so the track still plays its own patch. Add a piece for each drum."
+	else:
+		var r := SynthSongContext.channel_range(t)
+		_kit_info.text = "Occupies channel %d%s. Piece n plays on channel + n; a row no piece owns is silent." % [
+				r.x, "" if r.x == r.y else " to %d" % r.y]
+	_kit_warn.text = warn
+	_kit_warn.tooltip_text = warn
+	_kit_warn.visible = warn != ""
+	_add_piece.disabled = not _editable
+	_add_piece.tooltip_text = READONLY_TIP if not _editable else "Add a piece at the end, on the next note the kit does not play."
+	while _pieces.size() > t.kit.pieces.size():
+		var gone: PanelContainer = _pieces.pop_back()["panel"]
+		_piece_rows.remove_child(gone)
+		gone.queue_free()
+	while _pieces.size() < t.kit.pieces.size():
+		_pieces.append(_make_piece_row())
+	for i in _pieces.size():
+		_sync_piece(i, t.kit.pieces[i], t.synth_channel)
+
+func _make_piece_row() -> Dictionary:
+	var row := {}
+	var panel := PanelContainer.new()
+	_piece_rows.add_child(panel)
+	var box := VBoxContainer.new()
+	box.add_theme_constant_override("separation", 4)
+	panel.add_child(box)
+	var head := HBoxContainer.new()
+	head.add_theme_constant_override("separation", 6)
+	box.add_child(head)
+	var num := Label.new()
+	num.mouse_filter = Control.MOUSE_FILTER_PASS
+	head.add_child(num)
+	var name_edit := LineEdit.new()
+	name_edit.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	name_edit.custom_minimum_size.x = 60.0
+	name_edit.placeholder_text = "Name"
+	name_edit.tooltip_text = "What the piece is called in the Pattern view. Empty: the General MIDI name of its note."
+	name_edit.text_submitted.connect(func(_t: String): _commit_name(row))
+	name_edit.focus_exited.connect(func(): _commit_name(row))
+	head.add_child(name_edit)
+	var field := SynthResourceField.new()
+	field.setup("SynthPatch")
+	field.resource_changed.connect(func(r: Resource): piece_edited.emit(_pieces.find(row), &"patch", r, false))
+	field.resource_opened.connect(func(_r: Resource): piece_action.emit(&"open", _pieces.find(row)))
+	box.add_child(field)
+	var vals := HBoxContainer.new()
+	vals.add_theme_constant_override("separation", 4)
+	box.add_child(vals)
+	var note := _step_spin(vals, "Note", 0, 127, 1, "The pattern row (MIDI note) that triggers this piece. 36 kick, 38 snare, 42 closed hat.")
+	note.value_changed.connect(func(v: float): piece_edited.emit(_pieces.find(row), &"note", int(v), true))
+	var pitch := _step_spin(vals, "Pitch", -1, 127, 1, "The MIDI note the patch is played at. -1 plays it at the piece's note.")
+	pitch.value_changed.connect(func(v: float): piece_edited.emit(_pieces.find(row), &"pitch", int(v), true))
+	var vals2 := HBoxContainer.new()
+	vals2.add_theme_constant_override("separation", 4)
+	box.add_child(vals2)
+	var gain := _step_spin(vals2, "Gain", 0.0, 4.0, 0.01, "Multiplies the velocity of every note that plays this piece.")
+	gain.custom_arrow_step = 0.05
+	gain.value_changed.connect(func(v: float): piece_edited.emit(_pieces.find(row), &"gain", v, true))
+	var pan := _step_spin(vals2, "Pan", -1.0, 1.0, 0.05, "Added to the track's pan: -1 left, 0 centre, 1 right.")
+	pan.value_changed.connect(func(v: float): piece_edited.emit(_pieces.find(row), &"pan", v, true))
+	var btns := HBoxContainer.new()
+	btns.add_theme_constant_override("separation", 4)
+	box.add_child(btns)
+	row["panel"] = panel
+	row["num"] = num
+	row["name"] = name_edit
+	row["field"] = field
+	row["note"] = note
+	row["pitch"] = pitch
+	row["gain"] = gain
+	row["pan"] = pan
+	for e in [["up", "▲", &"up", "Move this piece earlier (it changes channel)."], ["down", "▼", &"down", "Move this piece later (it changes channel)."],
+			["remove", "Remove", &"remove", "Remove this piece. The pieces after it move down a channel."]]:
+		var action: StringName = e[2]
+		var b := _flat_button(e[1], func(): piece_action.emit(action, _pieces.find(row)))
+		b.tooltip_text = e[3]
+		btns.add_child(b)
+		row[e[0]] = b
+	var open := _flat_button("Open in Sound", func(): piece_action.emit(&"open", _pieces.find(row)))
+	open.tooltip_text = "Edit this piece's patch in Sound."
+	box.add_child(open)
+	row["open"] = open
+	var sb := SynthRackStyle.make_card_style(self)
+	sb.bg_color = SynthRackStyle.inset(self)
+	sb.content_margin_top = 6
+	sb.content_margin_bottom = 6
+	sb.content_margin_left = 6
+	sb.content_margin_right = 6
+	panel.add_theme_stylebox_override("panel", sb)
+	return row
+
+func _commit_name(row: Dictionary) -> void:
+	var i := _pieces.find(row)
+	var edit: LineEdit = row["name"]
+	if i < 0 or edit.text == row.get("shown_name", edit.text):
+		return
+	row["shown_name"] = edit.text
+	piece_edited.emit(i, &"name", edit.text, false)
+
+func _sync_piece(i: int, piece: SynthKitPiece, first_channel: int) -> void:
+	var row := _pieces[i]
+	var live := _editable and piece != null
+	var ch := first_channel + i
+	(row["num"] as Label).text = "ch %d" % ch
+	(row["num"] as Label).tooltip_text = "This piece plays on synth channel %d.%s" % [ch, " That channel does not exist: the piece is silent." if ch >= SynthEngine.CHANNEL_COUNT else ""]
+	(row["num"] as Label).add_theme_color_override("font_color", SynthRackStyle.warn(self) if ch >= SynthEngine.CHANNEL_COUNT else SynthRackStyle.dim(self))
+	var edit: LineEdit = row["name"]
+	row["shown_name"] = piece.name if piece != null else ""
+	if not edit.has_focus():
+		edit.text = piece.name if piece != null else ""
+	edit.placeholder_text = SynthPitchMap.piece_name(piece) if piece != null else "(empty)"
+	edit.editable = live
+	var field: SynthResourceField = row["field"]
+	field.set_resource(piece.patch if piece != null else null)
+	field.editable = live
+	(row["note"] as SpinBox).set_value_no_signal(piece.note if piece != null else 0)
+	(row["pitch"] as SpinBox).set_value_no_signal(piece.pitch if piece != null else -1)
+	(row["gain"] as SpinBox).set_value_no_signal(piece.gain if piece != null else 1.0)
+	(row["pan"] as SpinBox).set_value_no_signal(piece.pan if piece != null else 0.0)
+	for k in ["note", "pitch", "gain", "pan"]:
+		(row[k] as SpinBox).editable = live
+	(row["up"] as Button).disabled = not _editable or i == 0
+	(row["down"] as Button).disabled = not _editable or i == _pieces.size() - 1
+	(row["remove"] as Button).disabled = not _editable
+	(row["open"] as Button).disabled = piece == null or piece.patch == null
 
 func _make_step_row() -> Dictionary:
 	var row := {}
@@ -472,6 +663,45 @@ func get_pattern_field() -> SynthResourceField:
 
 func get_patch_field() -> SynthResourceField:
 	return _patch
+
+func get_kit_field() -> SynthResourceField:
+	return _kit
+
+func get_make_kit_button() -> Button:
+	return _make_kit
+
+func get_add_piece_button() -> Button:
+	return _add_piece
+
+## Whether the Kit slot is showing (a Drum track, or any track holding a kit).
+func is_kit_slot_shown() -> bool:
+	return _kit_row.visible
+
+## Whether the piece list is showing (the track holds a kit).
+func is_kit_shown() -> bool:
+	return _kit_box.visible
+
+func is_patch_row_shown() -> bool:
+	return _patch_row.visible
+
+func get_piece_count() -> int:
+	return _pieces.size() if _kit_box.visible else 0
+
+## Piece [param i]'s widgets: panel, num, name, field, note, pitch, gain, pan, up,
+## down, remove, open.
+func get_piece_row(i: int) -> Dictionary:
+	return _pieces[i]
+
+func get_kit_warning_text() -> String:
+	return _kit_warn.text if _kit_warn.visible else ""
+
+func get_kit_info_text() -> String:
+	return _kit_info.text if _kit_info.visible else ""
+
+## Report a name typed into piece [param i]'s name field, as pressing Enter does.
+func commit_piece_name(i: int, text: String) -> void:
+	(_pieces[i]["name"] as LineEdit).text = text
+	_commit_name(_pieces[i])
 
 func get_channel_spin() -> SpinBox:
 	return _channel

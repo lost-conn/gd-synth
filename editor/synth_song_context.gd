@@ -22,7 +22,7 @@ var live: bool = false
 ## The scene's MusicDataPlayer progression, if it has one.
 var music_data: MusicData
 ## One Dictionary per MusicTrack: name, type, pattern, pattern_path, patch,
-## patch_path, base_octave, channel.
+## patch_path, base_octave, channel, kit (the SynthKit of a DRUM track, else null).
 var tracks: Array = []
 
 ## Read [param path]: the scene open in the editor if it is, else its file. Null
@@ -66,6 +66,7 @@ func _collect(node: Node, root: Node) -> void:
 			"patch_path": path_of(t.patch),
 			"base_octave": t.base_octave,
 			"channel": t.synth_channel,
+			"kit": t.kit if t.track_type == MusicTrack.TrackType.DRUM else null,
 		})
 	for c in node.get_children():
 		_collect(c, root)
@@ -195,6 +196,36 @@ static func clash_text(p: MusicPattern, track_type: int) -> String:
 						i + 1, pattern_name(step.pattern), SynthPitchMap.type_name(match_type(step.pattern)), as_track, as_track]
 	return "The pattern is marked %s but this track plays it as %s: the game plays it as %s." % [
 			SynthPitchMap.type_name(own), as_track, as_track]
+
+## The channels a track occupies as [first, last]: its own channel, or a kit's
+## range (which may run past channel 15).
+static func channel_range(t: MusicTrack) -> Vector2i:
+	if t.uses_kit():
+		return Vector2i(t.synth_channel, t.synth_channel + t.kit.pieces.size() - 1)
+	return Vector2i(t.synth_channel, t.synth_channel)
+
+static func _range_text(r: Vector2i) -> String:
+	return "channel %d" % r.x if r.x == r.y else "channels %d to %d" % [r.x, r.y]
+
+## The warning for [param t]'s channels, or "": its kit runs past the synth's last
+## channel, or its channels overlap those of another of [param all] (the scene's
+## tracks) when either of the two plays a kit. Two plain tracks may share a channel.
+static func kit_warning(t: MusicTrack, all: Array) -> String:
+	var lines := PackedStringArray()
+	var own := t.get_kit_warning()
+	if own != "":
+		lines.append(own)
+	var r := channel_range(t)
+	for o in all:
+		var other := o as MusicTrack
+		if other == null or other == t or not (t.uses_kit() or other.uses_kit()):
+			continue
+		var q := channel_range(other)
+		if r.x <= q.y and q.x <= r.y:
+			lines.append("%s uses %s, which overlaps %s\"%s\" (%s): they take over each other's patches." % [
+					"This track's kit" if t.uses_kit() else "This track", _range_text(r),
+					"the kit of " if other.uses_kit() else "", other.name, _range_text(q)])
+	return "\n".join(lines)
 
 ## A pattern's name for labels: its resource_name, else its file, else "(inline)".
 static func pattern_name(p: Resource) -> String:
