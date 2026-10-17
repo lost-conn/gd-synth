@@ -10,6 +10,10 @@ var timeline: SynthTimeline
 ## Left edge and width of the area the beats map onto, in this control's space.
 var area_x: float = 0.0
 var area_w: float = 1.0
+## The song player whose position the cursor follows while a song plays: the cursor
+## is where the player's current section sits on the song's timeline, so a looped
+## section keeps it inside the section.
+var song_player: MusicDataPlayer
 var director: MusicDirector:
 	set(value):
 		director = value
@@ -30,7 +34,17 @@ func current_x() -> float:
 	var total := director.get_total_beats()
 	if not director.playing and total < 0.001:
 		return -1.0
-	return area_x + timeline.x_of(fposmod(total, timeline.span), area_w)
+	return area_x + timeline.x_of(beat_of(total), area_w)
+
+## The timeline beat for the director's [param total].
+func beat_of(total: float) -> float:
+	if timeline.song != null and song_player != null and is_instance_valid(song_player) and song_player.is_song_playing() \
+			and song_player.get_current_entry() >= 0:
+		var song := timeline.song
+		var entry := song_player.get_current_entry()
+		var base := song.entry_start(entry) + float(song_player.get_current_repeat()) * song.section_length(song.entries[entry].section)
+		return base + clampf(total - song_player.get_section_start_beat(), 0.0, song_player.get_section_length())
+	return timeline.cursor_of(total)
 
 func _process(_delta: float) -> void:
 	var x := roundf(current_x())

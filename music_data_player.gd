@@ -1,3 +1,4 @@
+@tool
 class_name MusicDataPlayer
 extends Node
 
@@ -83,6 +84,14 @@ enum QueueMode { NEXT_SECTION, NEXT_BAR, NEXT_BLOCK, NEXT_BEAT }
 ## Not used by a song, which always starts at once.
 @export var swap_mode: MusicDirector.SwapMode = MusicDirector.SwapMode.NEXT_BLOCK
 
+## Editor-only opt-in. This script is @tool so the Synth editor tab can run the real
+## song player over its preview rig; a MusicDataPlayer sitting in a scene that is
+## merely open in the editor must stay inert (no autoplay, no autoload lookup).
+## Only a node with this set to true BEFORE it enters the tree (the tab's own
+## song player) comes alive while Engine.is_editor_hint(). Ignored in a running
+## game. Not exported, so it is never saved into a scene.
+var editor_preview: bool = false
+
 ## Runtime reference to the global director. Auto-wired from /root/Music
 ## in [method _ready]; override via [method bind] if your project uses a
 ## different autoload name.
@@ -107,6 +116,8 @@ var _seeking: bool = false
 var _own: Dictionary = {}
 
 func _ready() -> void:
+	if Engine.is_editor_hint() and not editor_preview:
+		return
 	if director == null:
 		director = get_node_or_null("/root/Music") as MusicDirector
 	if autoplay:

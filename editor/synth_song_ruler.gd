@@ -3,6 +3,8 @@ class_name SynthSongRuler
 extends Control
 
 # The beat ruler above the track lanes. Click or drag on it to move the playhead.
+# With a song on the timeline it counts bars the way the player does, from the start
+# of each section (each repeat of an entry), and marks where the sections change.
 
 signal seek_requested(beat: float)
 
@@ -49,6 +51,9 @@ func _draw() -> void:
 	var dim := SynthRackStyle.dim(self)
 	var grid := SynthRackStyle.grid(self)
 	var ppb := size.x / maxf(timeline.span, 0.001)
+	if timeline.song != null:
+		_draw_song(s, font, fs, dim, grid, ppb)
+		return
 	var beats := int(ceilf(timeline.span))
 	for b in beats + 1:
 		var x := timeline.x_of(float(b), size.x)
@@ -60,3 +65,25 @@ func _draw() -> void:
 		if bar and b < beats and ppb * BEATS_PER_BAR > 22.0 * s:
 			draw_string(font, Vector2(x + 3.0 * s, fs + 2.0 * s), str(b / BEATS_PER_BAR + 1),
 					HORIZONTAL_ALIGNMENT_LEFT, -1, fs, dim)
+
+# Bar lines every beats_per_bar beats from the start of each section, numbered from 1
+# in the section; a stronger line where a section starts.
+func _draw_song(s: float, font: Font, fs: int, dim: Color, grid: Color, ppb: float) -> void:
+	var bpb := maxi(1, timeline.song.beats_per_bar)
+	for seg in timeline.segments:
+		var start: float = seg["start"]
+		var length: float = seg["length"]
+		var x0 := timeline.x_of(start, size.x)
+		draw_line(Vector2(x0, 0), Vector2(x0, size.y), Color(grid, grid.a * 3.0), 1.0)
+		var b := 0
+		while float(b) < length - 0.0001:
+			var bar: bool = b % bpb == 0
+			if bar or ppb >= 6.0 * s:
+				var x := timeline.x_of(start + float(b), size.x)
+				var h := size.y * (0.7 if bar else 0.3)
+				if b > 0:
+					draw_line(Vector2(x, size.y - h), Vector2(x, size.y), Color(grid, grid.a * 2.0 if bar else grid.a), 1.0)
+				if bar and ppb * float(bpb) > 22.0 * s:
+					draw_string(font, Vector2(x + 3.0 * s, fs + 2.0 * s), str(b / bpb + 1),
+							HORIZONTAL_ALIGNMENT_LEFT, -1, fs, dim)
+			b += 1

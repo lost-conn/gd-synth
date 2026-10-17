@@ -10,6 +10,9 @@ signal clip_activated
 ## A step clip of a chain was pressed / double-clicked.
 signal step_pressed(step: int)
 signal step_activated(step: int)
+## With a song: a region of the lane was pressed (its song entry) / double-clicked (its pattern).
+signal region_pressed(entry: int)
+signal region_activated(pattern: MusicPattern)
 signal mute_toggled(on: bool)
 signal solo_toggled(on: bool)
 
@@ -87,6 +90,8 @@ func _ready() -> void:
 	clips.clip_activated.connect(func(): clip_activated.emit())
 	clips.step_pressed.connect(func(i: int): step_pressed.emit(i))
 	clips.step_activated.connect(func(i: int): step_activated.emit(i))
+	clips.region_pressed.connect(func(e: int): region_pressed.emit(e))
+	clips.region_activated.connect(func(p: MusicPattern): region_activated.emit(p))
 	add_child(clips)
 	_restyle()
 

@@ -10,6 +10,12 @@ extends VBoxContainer
 #               the inspector toggle
 #   top lane    the progression: one chip per MusicBlock, sized by its length
 #   ruler       beats and bars; click or drag to move the playhead
+#   (a song)    when the scene's player plays a MusicSong: a section strip above the
+#               progression, the progression lane showing each section's own
+#               progression end to end, lanes that draw what each track does in each
+#               section, the ruler and playhead in song time, and a song panel below
+#               the lanes (entries, loop point, the selected section and its slots,
+#               preview of a section). See "Songs" below.
 #   lanes       one per MusicTrack: name, type, mute and solo, and its pattern as
 #               a clip repeating across the timeline (two trips through the
 #               progression, or the longest pattern if that is longer); a
@@ -31,6 +37,15 @@ extends VBoxContainer
 # PLAYBACK. Play in Track mode plays every lane together through the shared
 # SynthPreview (play_song): each lane on its own channel with its own patch, mute
 # and solo honoured. The playhead is a layer of its own, so only it repaints.
+#
+# SONGS. A scene whose MusicDataPlayer has a [member song] is arranged by section:
+# selecting an entry selects its section, the block drawer edits the blocks of that
+# section's progression (the song's when it has none of its own), and the BPM field
+# is the song's. Every edit is one action in the scene's history with the PLAYER as
+# its context (so it works whether the song is inline or a .tres), through
+# [method _song_edit]; Play goes through SynthPreview.play_music_song, which runs the
+# real MusicDataPlayer. A plain MusicData scene looks and plays exactly as before and
+# offers Convert to song.
 
 ## A scene was picked or cleared (path "" = cleared).
 signal scene_changed(path: String)
@@ -67,6 +82,13 @@ var tracks: Array[MusicTrack] = []
 var scene_data: MusicData
 var timeline := SynthTimeline.new()
 var selected_path: String = ""
+## The MusicSong the scene's player plays (null: a plain MusicData scene).
+var song: MusicSong
+## The player node that holds the song (or the music_data to convert), or null.
+var player: Node
+## The song entry shown selected (-1 none): its section is what the song panel and the
+## block drawer edit.
+var selected_entry: int = -1
 ## The step of the selected track's chain shown selected (-1 none).
 var selected_step: int = -1
 var muted: Dictionary = {}
@@ -95,6 +117,10 @@ var _announce_clear: bool = false
 var _data_key: String = ""
 var _ctx_sig: String = "\u0001"
 var _playing_specs: Array = []
+var _play_fp: String = ""
+var _loop_on: bool = false
+var _fallback_data: MusicData
+var _clean_fps: Dictionary = {}
 
 var _path_label: Label
 var _state_label: Label
@@ -138,6 +164,12 @@ var _blk_add: Button
 var _inspector: SynthTrackInspector
 var _dialog: FileDialog
 var _chain_dialog: FileDialog
+var _song_dialog: FileDialog
+var _convert_btn: Button
+var _strip_row: HBoxContainer
+var _strip_gutter: Control
+var _strip: SynthSectionStrip
+var _song_panel: SynthSongPanel
 var _chain_save_track: String = ""
 var _merge_key: String = ""
 var _timer: Timer
@@ -279,6 +311,12 @@ func _build_header() -> void:
 	_add_btn.focus_mode = Control.FOCUS_NONE
 	_add_btn.pressed.connect(add_track)
 	bar.add_child(_add_btn)
+	_convert_btn = Button.new()
+	_convert_btn.text = "Convert to song"
+	_convert_btn.focus_mode = Control.FOCUS_NONE
+	_convert_btn.visible = false
+	_convert_btn.pressed.connect(convert_to_song)
+	bar.add_child(_convert_btn)
 	_inspector_btn = Button.new()
 	_inspector_btn.text = "Inspector"
 	_inspector_btn.toggle_mode = true
@@ -320,6 +358,27 @@ func _build_body() -> void:
 	col.add_theme_constant_override("separation", int(4 * s))
 	_stage.add_child(col)
 
+	# Section strip (songs only): a gutter with the title, then one chip per entry repeat.
+	_strip_row = HBoxContainer.new()
+	_strip_row.add_theme_constant_override("separation", 0)
+	_strip_row.visible = false
+	col.add_child(_strip_row)
+	var sg := HBoxContainer.new()
+	_strip_gutter = sg
+	_strip_row.add_child(sg)
+	var sl := Label.new()
+	sl.text = "Sections"
+	sl.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	sl.size_flags_vertical = Control.SIZE_SHRINK_CENTER
+	sl.tooltip_text = "The song's running order. Click a chip to edit its section below."
+	sl.mouse_filter = Control.MOUSE_FILTER_PASS
+	sg.add_child(sl)
+	_strip = SynthSectionStrip.new()
+	_strip.timeline = timeline
+	_strip.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	_strip.entry_selected.connect(select_entry)
+	_strip_row.add_child(_strip)
+
 	# Progression row: a gutter with the title and +, then the chips.
 	var prog_row := HBoxContainer.new()
 	prog_row.add_theme_constant_override("separation", 0)
@@ -335,6 +394,7 @@ func _build_body() -> void:
 	_prog_lane = SynthProgressionLane.new()
 	_prog_lane.timeline = timeline
 	_prog_lane.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	_prog_lane.block_picked.connect(_on_block_picked)
 	_prog_lane.block_selected.connect(_select_block)
 	prog_row.add_child(_prog_lane)
 
@@ -376,6 +436,24 @@ func _build_body() -> void:
 	_playhead.set_anchors_and_offsets_preset(Control.PRESET_FULL_RECT)
 	_stage.add_child(_playhead)
 
+	_song_panel = SynthSongPanel.new()
+	_song_panel.visible = false
+	_song_panel.entry_action.connect(_on_entry_action)
+	_song_panel.add_existing_requested.connect(func(sec: MusicSection): add_existing_entry(sec))
+	_song_panel.entry_repeats_edited.connect(func(v: int): set_entry_repeats(selected_entry, v, true))
+	_song_panel.section_name_edited.connect(func(t: String): set_section_name(selected_section(), t))
+	_song_panel.section_repeats_edited.connect(func(v: int): set_section_repeats(selected_section(), v, true))
+	_song_panel.own_progression_toggled.connect(func(on: bool): set_own_progression(selected_section(), on))
+	_song_panel.slot_mode_edited.connect(func(t: StringName, m: int): set_slot_mode(selected_section(), t, m))
+	_song_panel.slot_pattern_edited.connect(func(t: StringName, p: MusicPattern): set_slot_pattern(selected_section(), t, p))
+	_song_panel.slot_open_requested.connect(func(t: StringName): open_slot_pattern(selected_section(), t))
+	_song_panel.beats_per_bar_edited.connect(func(v: int): set_beats_per_bar(v, true))
+	_song_panel.also_bake_added.connect(func(sec: MusicSection): add_also_bake(sec))
+	_song_panel.also_bake_removed.connect(func(i: int): remove_also_bake(i))
+	_song_panel.save_song_requested.connect(_ask_save_song)
+	_song_panel.play_section_requested.connect(func(): play_from_section())
+	_song_panel.loop_section_toggled.connect(set_loop_section)
+	main.add_child(_song_panel)
 	_build_drawer(main)
 
 	_inspector = SynthTrackInspector.new()
@@ -499,6 +577,13 @@ func _build_dialogs() -> void:
 	_chain_dialog.size = Vector2i(720, 520)
 	_chain_dialog.file_selected.connect(_on_chain_path_chosen)
 	add_child(_chain_dialog)
+	_song_dialog = FileDialog.new()
+	_song_dialog.file_mode = FileDialog.FILE_MODE_SAVE_FILE
+	_song_dialog.access = FileDialog.ACCESS_RESOURCES
+	_song_dialog.filters = PackedStringArray(["*.tres ; Song Resource"])
+	_song_dialog.size = Vector2i(720, 520)
+	_song_dialog.file_selected.connect(func(path: String): save_song_to(path))
+	add_child(_song_dialog)
 
 # Editor-theme icons when the editor theme is inherited; the plain text anywhere else.
 func _apply_icons() -> void:
@@ -520,6 +605,7 @@ func _relayout() -> void:
 	var g := _gutter()
 	_prog_gutter.custom_minimum_size.x = g
 	_ruler_gutter.custom_minimum_size.x = g
+	_strip_gutter.custom_minimum_size.x = g
 	for lane in _lanes:
 		lane.set_gutter(g)
 	_place_playhead.call_deferred()
@@ -563,6 +649,8 @@ func set_scene(path: String, announce: bool = true) -> void:
 	scene_path = path
 	_selected_block = -1
 	selected_path = ""
+	selected_entry = -1
+	_clean_fps.clear()
 	muted.clear()
 	soloed.clear()
 	_free_detached()
@@ -620,6 +708,15 @@ func get_lanes() -> Array[SynthTrackLane]:
 
 func get_progression_lane() -> SynthProgressionLane:
 	return _prog_lane
+
+func get_strip() -> SynthSectionStrip:
+	return _strip
+
+func get_song_panel() -> SynthSongPanel:
+	return _song_panel
+
+func get_convert_button() -> Button:
+	return _convert_btn
 
 func get_ruler() -> SynthSongRuler:
 	return _ruler
@@ -744,6 +841,7 @@ func _signature() -> String:
 					"-" if t.kit == null else "%d:%s" % [t.kit.get_instance_id(), t.kit.signature()]]
 		var d := SynthSongContext.find_music_data(_root)
 		s += "D%s" % (str(d.get_instance_id()) if d != null else "-")
+		s += "|S" + SynthSongLayout.fingerprint(SynthSongContext.find_song(_root), _res_sig)
 	s += "|" + SynthHarmony.fingerprint(_display_data())
 	return s
 
@@ -795,29 +893,63 @@ func _on_preview_data_changed(_d: MusicData) -> void:
 # Building what is shown
 # ---------------------------------------------------------------------------
 
-# The progression the lanes sit over: what the preview plays.
+# The progression the lanes sit over: what the preview plays. With a song: the
+# selected section's, which is the song's unless the section has one of its own.
 func _display_data() -> MusicData:
+	if song != null:
+		var d := _song_data()
+		if d != null:
+			return d
+		if _fallback_data == null:
+			_fallback_data = SynthPreview.make_default_music_data()
+		return _fallback_data
 	if _preview != null:
 		return _preview.get_effective_music_data()
 	return scene_data if scene_data != null and not scene_data.blocks.is_empty() else SynthPreview.make_default_music_data()
+
+func _song_data() -> MusicData:
+	var sec := selected_section()
+	if sec != null:
+		var d := sec.get_progression(song)
+		if d != null:
+			return d
+	return song.get_display_progression()
+
+## The section of the selected entry (null: none selected, or no song).
+func selected_section() -> MusicSection:
+	if song == null or selected_entry < 0 or selected_entry >= song.entries.size() or song.entries[selected_entry] == null:
+		return null
+	return song.entries[selected_entry].section
+
+## Does the displayed MusicData belong to the song, rather than being the preview's
+## default? (A progression the block drawer can edit.)
+func _is_real_data(d: MusicData) -> bool:
+	return d != null and d != _fallback_data
 
 func _rebuild() -> void:
 	if not _built:
 		return
 	tracks.clear()
 	scene_data = null
+	song = null
+	player = null
 	if _root != null and is_instance_valid(_root):
 		_collect(_root, tracks)
 		scene_data = SynthSongContext.find_music_data(_root)
+		player = SynthSongContext.find_player(_root)
+		song = player.get("song") as MusicSong if player != null else null
+	_clamp_selected_entry()
 	_note_data()
 	_announce_data_change()
 
+	timeline.set_song(song)
 	timeline.data = _display_data()
-	var longest := 0.0
-	for t in tracks:
-		if t.pattern != null:
-			longest = maxf(longest, t.pattern.get_play_length())
-	timeline.span = SynthTimeline.choose_span(timeline.progression_beats(), longest)
+	if song == null:
+		var longest := 0.0
+		for t in tracks:
+			if t.pattern != null:
+				longest = maxf(longest, t.pattern.get_play_length())
+		timeline.span = SynthTimeline.choose_span(timeline.progression_beats(), longest)
 
 	if _selected_index() < 0:
 		selected_path = _track_path(tracks[0]) if not tracks.is_empty() else ""
@@ -825,9 +957,11 @@ func _rebuild() -> void:
 	_header_refresh()
 	_rebuild_lanes()
 	_prog_lane.selected = clampi(_selected_block, -1, timeline.data.blocks.size() - 1) if timeline.data != null else -1
+	_prog_lane.selected_data = timeline.data if song != null else null
 	_selected_block = _prog_lane.selected
 	_prog_lane.queue_redraw()
 	_ruler.queue_redraw()
+	_refresh_song_ui()
 	_sync_drawer()
 	_refresh_bake()
 	_refresh_inspector()
@@ -869,12 +1003,19 @@ func _rebuild_lanes() -> void:
 		lane.clips.track_type = int(t.track_type)
 		lane.clips.color = color
 		lane.clips.clip_name = _res_name(t.pattern, "(inline pattern)")
+		lane.clips.regions = _lane_regions(t)
+		lane.clips.selected_entry = selected_entry
 		lane.clips.rebuild()
 		var path := _track_path(t)
 		lane.selected.connect(_select_path.bind(path))
 		lane.clip_activated.connect(func(): _open_pattern_of(_index_of_path(path)))
 		lane.step_pressed.connect(func(step: int): select_step(step))
 		lane.step_activated.connect(func(step: int): open_step_pattern(_index_of_path(path), step))
+		lane.region_pressed.connect(select_entry)
+		lane.region_activated.connect(func(p: MusicPattern):
+			var k := _index_of_path(path)
+			if p != null and k >= 0:
+				pattern_requested.emit(p, tracks[k].patch))
 		lane.mute_toggled.connect(func(on: bool): _set_mute(path, on))
 		lane.solo_toggled.connect(func(on: bool): _set_solo(path, on))
 		lane.set_selected(path == selected_path)
@@ -913,7 +1054,26 @@ func _lane_warning(t: MusicTrack) -> String:
 	var kit := SynthSongContext.kit_warning(t, tracks)
 	if kit != "":
 		lines.append(kit)
+	if song != null:
+		# The patterns the song's PLAY slots give this track are played as its type too.
+		var seen := {}
+		for sec in song.get_reachable_sections():
+			var slot := sec.get_slot(StringName(t.name))
+			if slot != null and slot.mode == MusicSectionSlot.Mode.PLAY and slot.pattern != null and not seen.has(slot.pattern):
+				seen[slot.pattern] = true
+				var c := SynthSongContext.clash_text(slot.pattern, int(t.track_type))
+				if c != "":
+					lines.append("In %s: %s" % [SynthSongLayout.section_label(sec), c])
 	return "\n".join(lines)
+
+# What the lane draws on a song's timeline: its regions, tinted with the section colour.
+func _lane_regions(t: MusicTrack) -> Array:
+	if song == null:
+		return []
+	var out := SynthSongLayout.lane_regions(song, StringName(t.name), t.pattern, t.autoplay)
+	for r in out:
+		r["tint"] = SynthSongLayout.section_color(song, r["section"])
+	return out
 
 static func _res_name(res: Resource, fallback: String) -> String:
 	if res == null:
@@ -947,16 +1107,29 @@ func _header_refresh() -> void:
 	_add_btn.tooltip_text = "Add a MusicTrack to the scene (undoable)."
 	var d := _display_data()
 	var editable := _data_editable()
-	_bpm_spin.set_value_no_signal(d.bpm)
-	_bpm_spin.editable = editable
+	_convert_btn.visible = song == null and player != null
+	_convert_btn.disabled = not live or scene_data == null or scene_data.blocks.is_empty()
+	_convert_btn.tooltip_text = _convert_tip()
+	if song != null:
+		_bpm_spin.set_value_no_signal(song.bpm)
+		_bpm_spin.editable = live
+		_bpm_spin.tooltip_text = "The song's tempo: MusicSong.bpm. A section's own progression has no tempo of its own."
+	else:
+		_bpm_spin.set_value_no_signal(d.bpm)
+		_bpm_spin.editable = editable
+		_bpm_spin.tooltip_text = "The song's tempo: MusicData.bpm."
 	_swing_spin.set_value_no_signal(_swing)
-	if _preview != null and _preview.is_using_default_data():
+	if song == null and _preview != null and _preview.is_using_default_data():
 		_data_label.text = "(default)"
 		_data_label.tooltip_text = "No MusicData is chosen, so the preview runs against the built-in default. Pick a scene that has one, or Choose one in the top bar."
+	elif song != null and not _is_real_data(d):
+		_data_label.text = "(default)"
+		_data_label.tooltip_text = "The song has no progression, neither its own nor in a section, so the lanes sit over the built-in default."
 	else:
 		var p := _data_path(d)
 		_data_label.text = p.get_file() if p != "" else "(inline)"
-		_data_label.tooltip_text = p if p != "" else "The MusicData is stored inside the scene."
+		_data_label.tooltip_text = (p if p != "" else "The MusicData is stored inside the scene.") \
+				+ ("\nThis is the progression of the selected section." if song != null else "")
 	_save_btn.visible = _edited_flag and _data_path(d) != ""
 	_save_btn.tooltip_text = "Write %s." % _data_path(d)
 
@@ -1160,10 +1333,12 @@ func _apply_audibility(push: bool) -> void:
 func _lane_spec(i: int) -> Dictionary:
 	var t := tracks[i]
 	return {"pattern": t.pattern, "type": int(t.track_type), "patch": t.patch, "channel": t.synth_channel,
-			"base_octave": t.base_octave, "pan": t.pan, "audible": is_audible(i),
+			"base_octave": t.base_octave, "pan": t.pan, "audible": is_audible(i), "name": String(t.name),
+			"active": t.autoplay,
 			"kit": t.kit if t.uses_kit() else null, "kit_key": t.kit.signature() if t.uses_kit() else ""}
 
-## Play every lane together, from the playhead.
+## Play every lane together, from the playhead. A song plays through the real song
+## player, from the entry the playhead is in.
 func start_song() -> void:
 	if _preview == null:
 		return
@@ -1172,10 +1347,64 @@ func start_song() -> void:
 	var specs: Array = []
 	for i in tracks.size():
 		specs.append(_lane_spec(i))
+	if song != null and not timeline.segments.is_empty():
+		var at := song.entry_at_beat(_cursor_beat)
+		_start_music_song(specs, int(at.get("entry", timeline.segments[0]["entry"])), _cursor_beat)
+		return
 	_preview.play_song(specs, _cursor_beat)
 	_playing_specs = specs.map(_spec_key)
 	_song_started = true
+	_playhead.song_player = null
 	_playhead.director = _preview.director
+
+func _start_music_song(specs: Array, entry: int, beat: float) -> void:
+	_preview.play_music_song(song, specs, entry, beat)
+	_playing_specs = specs.map(_spec_key)
+	_play_fp = _music_fp()
+	_song_started = true
+	_playhead.song_player = _preview.song_player
+	_playhead.director = _preview.director
+	_apply_loop()
+
+# What a running song depends on: the song itself (by identity, not by what a pattern
+# holds) and the lanes' specs.
+func _music_fp() -> String:
+	return SynthSongLayout.fingerprint(song, func(p): return str(p.get_instance_id()) if p != null else "-")
+
+## Play the song from the start of entry [param entry] (the selected one by default),
+## through the real song player. The playhead goes back to that start when it stops.
+func play_from_section(entry: int = -1) -> bool:
+	if song == null or _preview == null:
+		return false
+	if entry < 0:
+		entry = selected_entry
+	if entry < 0 or entry >= song.entries.size() or song.entry_length(entry) <= 0.0:
+		return false
+	_preview.ensure_started()
+	_preview.director.swing_amount = _swing
+	var specs: Array = []
+	for i in tracks.size():
+		specs.append(_lane_spec(i))
+	_cursor_beat = song.entry_start(entry)
+	_start_music_song(specs, entry, _cursor_beat)
+	return true
+
+## Loop the selected section while the song plays (each pass restarts its PLAY slots);
+## off, the song goes on in order from the next boundary. Picking another entry while
+## it is on loops that one.
+func set_loop_section(on: bool) -> void:
+	_loop_on = on
+	_apply_loop()
+	if _song_panel != null:
+		_refresh_song_panel()
+
+func is_loop_section_on() -> bool:
+	return _loop_on
+
+func _apply_loop() -> void:
+	if _preview == null or song == null or not _preview.is_music_song_on():
+		return
+	_preview.set_loop_section(selected_entry if _loop_on and selected_entry >= 0 else -1)
 
 func stop_song() -> void:
 	if _preview != null:
@@ -1183,6 +1412,12 @@ func stop_song() -> void:
 
 func is_song_playing() -> bool:
 	return _preview != null and _preview.is_song_on() and _preview.is_playing()
+
+## The song's timeline beat the playhead is at now (the cursor when stopped).
+func current_song_beat() -> float:
+	if _preview == null or _preview.director == null or not _preview.is_playing():
+		return _cursor_beat
+	return _playhead.beat_of(_preview.director.get_total_beats())
 
 func toggle_song() -> void:
 	if is_song_playing():
@@ -1193,6 +1428,9 @@ func toggle_song() -> void:
 # A track changed while the song plays: carry the change into the running song.
 func _sync_song_playback() -> void:
 	if _preview == null or not _preview.is_song_on() or not _preview.is_playing():
+		return
+	if _preview.is_music_song_on() or song != null:
+		_sync_music_song()
 		return
 	if _preview.song_tracks.size() != tracks.size():
 		var at := _preview.director.get_total_beats()
@@ -1206,6 +1444,28 @@ func _sync_song_playback() -> void:
 			_preview.update_song_lane(i, spec)
 			if i < _playing_specs.size():
 				_playing_specs[i] = key
+
+# The running song changed under the player (an edit, an undo, a pattern swapped): play
+# it again from where the playhead is, the lanes and sections as they are now.
+func _sync_music_song() -> void:
+	if song == null:
+		if _preview.is_music_song_on():
+			_preview.stop()   # the song went away (undo of Convert to song)
+		return
+	if timeline.segments.is_empty():
+		return
+	var specs: Array = []
+	for i in tracks.size():
+		specs.append(_lane_spec(i))
+	var keys := specs.map(_spec_key)
+	if _preview.is_music_song_on() and _preview.get_music_song() == song and _play_fp == _music_fp() and keys == _playing_specs:
+		return
+	var beat := current_song_beat()
+	var at := song.entry_at_beat(beat)
+	if at.is_empty():
+		return
+	_cursor_beat = clampf(beat, 0.0, timeline.span)
+	_start_music_song(specs, int(at["entry"]), _cursor_beat)
 
 # A lane's spec without mute / solo, which the preview is told about separately.
 static func _spec_key(spec: Dictionary) -> Dictionary:
@@ -1705,6 +1965,8 @@ static func _data_path(d: MusicData) -> String:
 # A real MusicData of the scene or the project, not the built-in fallback; and, if
 # it lives inside the scene, only while the scene is open.
 func _data_editable() -> bool:
+	if song != null:
+		return _is_real_data(_display_data()) and (live or not _is_builtin(_display_data()))
 	if _preview == null or _preview.is_using_default_data():
 		return false
 	var d := _display_data()
@@ -1712,20 +1974,21 @@ func _data_editable() -> bool:
 		return false
 	return true
 
-# Track which MusicData the "edited" flag speaks for.
+# Track which MusicData the "edited" flag speaks for. Each MusicData is remembered as
+# it was when first shown, so moving between a song's sections keeps each one's mark.
 func _note_data() -> void:
 	var d := _display_data()
-	if d != _clean_data:
-		_set_edited_flag(false)
-		_clean_data = d
-		_clean_fp = SynthHarmony.fingerprint(d)
-		return
+	if not _clean_fps.has(d):
+		_clean_fps[d] = SynthHarmony.fingerprint(d)
+	_clean_data = d
+	_clean_fp = _clean_fps[d]
 	_set_edited_flag(SynthHarmony.fingerprint(d) != _clean_fp)
 
 # The tab's top bar shows the tempo and chords too: tell it when they changed, by
 # an edit here or one made elsewhere (Ctrl+Z).
 func _announce_data_change() -> void:
-	var key := "%s|%s" % [_display_data().get_instance_id() if _display_data() != null else 0, SynthHarmony.fingerprint(_display_data())]
+	var key := "%s|%s|%s" % [_display_data().get_instance_id() if _display_data() != null else 0, SynthHarmony.fingerprint(_display_data()),
+			song.bpm if song != null else "-"]
 	if key == _data_key:
 		return
 	var first := _data_key == ""
@@ -1734,12 +1997,11 @@ func _announce_data_change() -> void:
 		music_data_edited.emit()
 
 func _set_edited_flag(dirty: bool) -> void:
-	if dirty == _edited_flag:
-		return
+	var changed := dirty != _edited_flag
 	_edited_flag = dirty
 	var ei := _editor_interface()
 	var target: MusicData = _clean_data
-	if ei != null and target != null:
+	if ei != null and target != null and (changed or dirty):
 		ei.call("set_object_edited", target, dirty)
 
 func is_data_dirty() -> bool:
@@ -1756,6 +2018,7 @@ func save_music_data() -> bool:
 		push_error("[SynthTrackView] Could not save %s (err=%d)" % [path, err])
 		return false
 	_clean_fp = SynthHarmony.fingerprint(d)
+	_clean_fps[d] = _clean_fp
 	_clean_data = d
 	_set_edited_flag(false)
 	var ei := _editor_interface()
@@ -1768,8 +2031,12 @@ func save_music_data() -> bool:
 func _on_bpm_changed(v: float) -> void:
 	set_bpm(v, true)
 
-## Set the song's tempo (MusicData.bpm), as one undo action.
+## Set the song's tempo (MusicData.bpm; MusicSong.bpm in a song), as one undo action.
 func set_bpm(v: float, merge: bool = false) -> void:
+	if song != null:
+		if not is_equal_approx(song.bpm, v):
+			_song_edit("Set BPM", [[song, &"bpm", v]], "bpm" if merge else "")
+		return
 	if not _data_editable():
 		return
 	var d := _display_data()
@@ -1813,6 +2080,9 @@ func _sync_drawer() -> void:
 	_blk_add.tooltip_text = "Add a block after this one, copied from it."
 	var b: MusicBlock = d.blocks[i]
 	_drawer_title.text = "Block %d of %d: %s" % [i + 1, d.blocks.size(), SynthHarmony.chord_name(b)]
+	var sec := selected_section()
+	if sec != null:
+		_drawer_title.text += "  (%s)" % SynthSongLayout.section_label(sec)
 	_blk_root.select(posmod(b.chord_root, 12))
 	_blk_sroot.select(posmod(b.scale_root, 12))
 	_blk_quality.clear()
@@ -1857,7 +2127,7 @@ func _edit_block(label: String, prop: StringName, value: Variant, merge: bool = 
 	var b: MusicBlock = d.blocks[_selected_block]
 	if b.get(prop) == value:
 		return
-	_edit.set_properties(label, d, [[b, prop, value]], merge, [d])
+	_edit.set_properties(label, _block_ctx(d), [[b, prop, value]], merge, [d])
 	_after_data_edit()
 
 ## Set a property of block [param i] (chord_root, chord_intervals, scale_root,
@@ -1943,12 +2213,456 @@ func remove_block() -> void:
 
 func _set_blocks(label: String, arr: Array[MusicBlock], select: int) -> void:
 	var d := _display_data()
-	_edit.set_properties(label, d, [[d, &"blocks", arr]], false, [d])
+	_edit.set_properties(label, _block_ctx(d), [[d, &"blocks", arr]], false, [d])
 	_selected_block = select
 	_after_data_edit()
+
+# The object a block edit belongs to in the editor's history: the MusicData in a plain
+# scene; the player in a song, so that a progression a section just got (not in any
+# file or scene yet) lands in the scene's history too.
+func _block_ctx(d: MusicData) -> Object:
+	return player if song != null and live and player != null else d
 
 func _after_data_edit() -> void:
 	if _preview != null:
 		_preview.progression_edited()
 	_sig = ""
 	refresh(true)
+
+# ---------------------------------------------------------------------------
+# Songs (the MusicSong the scene's player plays)
+#
+# Every change is one action in the scene's history with the PLAYER as its context,
+# whether the song is inline in the scene or a .tres of its own. A property of the
+# song, an entry, a section or a slot is set on that resource; adding, removing or
+# moving entries, slots or also_bake sections replaces the array with a modified
+# copy. The song is told it changed afterwards (do and undo). A song in a file of
+# its own is marked edited in the editor (its resource is not saved until you do).
+# ---------------------------------------------------------------------------
+
+# One action on the scene. [param touched]: resources changed besides the song, told
+# afterwards. [param merge_key] non-empty: fold into the previous action if it had
+# the same key (spin box clicks on one property).
+func _song_edit(label: String, changes: Array, merge_key: String = "", touched: Array = []) -> bool:
+	if not live or song == null or player == null:
+		_refresh_song_panel()   # a read-only panel snaps back to what the song holds
+		return false
+	var told: Array = [song]
+	told.append_array(touched)
+	_edit.set_properties(label, player, changes, merge_key != "" and merge_key == _merge_key, told)
+	_merge_key = merge_key
+	var ei := _editor_interface()
+	if ei != null:
+		for r in told:
+			if SynthSongContext.path_of(r) != "":
+				ei.call("set_object_edited", r, true)
+	_sig = ""
+	refresh(true)
+	return true
+
+func _clamp_selected_entry() -> void:
+	if song == null:
+		selected_entry = -1
+		return
+	if selected_entry >= 0 and selected_entry < song.entries.size() and song.entries[selected_entry] != null \
+			and song.entries[selected_entry].section != null:
+		return
+	selected_entry = -1
+	for i in song.entries.size():
+		if song.entries[i] != null and song.entries[i].section != null:
+			selected_entry = i
+			return
+
+## Select song entry [param i]: its section is what the song panel and the block
+## drawer edit, as clicking its chip in the strip does.
+func select_entry(i: int) -> void:
+	if song == null or i < 0 or i >= song.entries.size() or song.entries[i] == null or song.entries[i].section == null \
+			or i == selected_entry:
+		return
+	selected_entry = i
+	_selected_block = -1
+	_open_chord_custom = null
+	_open_scale_custom = null
+	timeline.data = _display_data()
+	_prog_lane.selected = -1
+	_prog_lane.selected_data = timeline.data
+	_strip.selected_entry = i
+	for lane in _lanes:
+		lane.clips.selected_entry = i
+	_note_data()
+	_announce_data_change()
+	_header_refresh()
+	_refresh_song_panel()
+	_sync_drawer()
+	_apply_loop()
+
+func _on_block_picked(entry: int, _index: int) -> void:
+	if entry >= 0:
+		select_entry(entry)
+
+# The strip, the panel and the stage's height for the song (or without one).
+func _refresh_song_ui() -> void:
+	var on := song != null
+	_strip_row.visible = on
+	_song_panel.visible = on
+	_stage.custom_minimum_size.y = (210.0 + (40.0 if on else 0.0)) * _s()
+	_strip.selected_entry = selected_entry
+	_strip.queue_redraw()
+	if on:
+		_refresh_song_panel()
+
+func _refresh_song_panel() -> void:
+	if song == null or _song_panel == null:
+		return
+	var sec := selected_section()
+	var entry: MusicSongEntry = song.entries[selected_entry] if sec != null else null
+	var info := {
+		"editable": live, "banner": "" if live else "Read-only: the scene is not open in the editor. Use \"Open scene to edit\".",
+		"where": SynthSongContext.path_of(song).get_file() if SynthSongContext.path_of(song) != "" else "(inline song)",
+		"beats_per_bar": song.beats_per_bar, "entry": selected_entry if sec != null else -1, "entry_count": song.entries.size(),
+		"entry_repeats": entry.repeats if entry != null else 1, "loop_entry": song.get_loop_entry(),
+		"can_loop_here": sec != null and selected_entry != song.get_loop_entry(),
+		"section": sec, "loop_on": _loop_on, "can_play": sec != null and song.entry_length(selected_entry) > 0.0,
+		"existing": song.get_reachable_sections(),
+	}
+	var baked := PackedStringArray()
+	var candidates: Array = []
+	for b in song.also_bake:
+		baked.append(SynthSongLayout.section_label(b))
+	for r in song.get_reachable_sections():
+		if not song.also_bake.has(r):
+			candidates.append(r)
+	info["also_bake"] = Array(baked)
+	info["also_candidates"] = candidates
+	if sec != null:
+		info["color"] = SynthSongLayout.section_color(song, sec)
+		info["section_name"] = sec.name
+		info["section_repeats"] = sec.repeats
+		info["own"] = sec.progression != null
+		info["can_own"] = sec.progression != null or _is_real_data(song.progression) or _is_real_data(sec.get_progression(song))
+		var rows: Array = []
+		var names := {}
+		for t in tracks:
+			names[StringName(t.name)] = true
+			var slot := sec.get_slot(StringName(t.name))
+			rows.append({"name": t.name, "mode": slot.mode if slot != null else MusicSectionSlot.Mode.KEEP,
+					"pattern": slot.pattern if slot != null else null, "track_pattern": t.pattern})
+		info["tracks"] = rows
+		var orphans := PackedStringArray()
+		for slot in sec.slots:
+			if slot != null and not names.has(slot.track) and not orphans.has(String(slot.track)):
+				orphans.append(String(slot.track))
+		info["orphans"] = orphans
+	_song_panel.show_song(info)
+
+func _on_entry_action(action: StringName) -> void:
+	match action:
+		&"add_new":
+			add_section_entry()
+		&"duplicate":
+			duplicate_entry(selected_entry)
+		&"remove":
+			remove_entry(selected_entry)
+		&"left":
+			move_entry(selected_entry, -1)
+		&"right":
+			move_entry(selected_entry, 1)
+		&"loop_here":
+			set_loop_entry(selected_entry)
+
+# --- Entries ---------------------------------------------------------------
+
+# Insert [param entry] at [param at], keeping the loop entry on the entry it was on.
+func _insert_entry(label: String, entry: MusicSongEntry, at: int) -> bool:
+	if song == null or not live:
+		return false
+	var arr: Array[MusicSongEntry] = song.entries.duplicate()
+	at = clampi(at, 0, arr.size())
+	arr.insert(at, entry)
+	var changes: Array = [[song, &"entries", arr]]
+	if not song.entries.is_empty() and at <= song.get_loop_entry():
+		changes.append([song, &"loop_entry", song.get_loop_entry() + 1])
+	selected_entry = at
+	return _song_edit(label, changes)
+
+func _insert_point() -> int:
+	return selected_entry + 1 if selected_entry >= 0 else song.entries.size()
+
+## Add an entry after the selected one with a new, empty section (it plays the song's
+## progression and keeps every track), as one undo action.
+func add_section_entry() -> bool:
+	if song == null:
+		return false
+	var sec := MusicSection.create(SynthSongLayout.new_section_name(song))
+	return _insert_entry("Add section", MusicSongEntry.create(sec), _insert_point())
+
+## Add an entry after the selected one that plays [param section], a section the song
+## already has (shared, not copied), as one undo action.
+func add_existing_entry(section: MusicSection) -> bool:
+	if song == null or section == null:
+		return false
+	return _insert_entry("Add existing section", MusicSongEntry.create(section), _insert_point())
+
+## Add an entry after entry [param i] that plays a copy of its section (progression
+## and slots copied, the patterns shared), as one undo action.
+func duplicate_entry(i: int) -> bool:
+	if song == null or i < 0 or i >= song.entries.size() or song.entries[i] == null or song.entries[i].section == null:
+		return false
+	var src := song.entries[i]
+	selected_entry = i
+	return _insert_entry("Duplicate section", MusicSongEntry.create(copy_section(src.section), src.repeats), i + 1)
+
+## A copy of [param src] that shares nothing with it but the patterns: a new section
+## with a copy of its own progression (if it has one) and new slots.
+func copy_section(src: MusicSection) -> MusicSection:
+	var c := MusicSection.create(_unique_section_name("%s copy" % src.name if src.name != "" else "Section copy"),
+			copy_music_data(src.progression), src.repeats)
+	for slot in src.slots:
+		if slot != null:
+			c.slots.append(MusicSectionSlot.create(slot.track, slot.mode, slot.pattern))
+	return c
+
+## A MusicData with the tempo of [param src] and a copy of every block (null for null).
+static func copy_music_data(src: MusicData) -> MusicData:
+	if src == null:
+		return null
+	var d := MusicData.new()
+	d.bpm = src.bpm
+	var blocks: Array[MusicBlock] = []
+	for b in src.blocks:
+		blocks.append(b.duplicate() if b != null else MusicBlock.new())
+	d.blocks = blocks
+	return d
+
+func _unique_section_name(base: String) -> String:
+	var used := {}
+	for sec in song.get_reachable_sections():
+		used[sec.name] = true
+	if not used.has(base):
+		return base
+	var n := 2
+	while used.has("%s %d" % [base, n]):
+		n += 1
+	return "%s %d" % [base, n]
+
+## Remove entry [param i] (the last one stays), as one undo action. Its section stays
+## in the song if another entry or also_bake has it.
+func remove_entry(i: int) -> bool:
+	if song == null or not live or i < 0 or i >= song.entries.size() or song.entries.size() <= 1:
+		return false
+	var arr: Array[MusicSongEntry] = song.entries.duplicate()
+	arr.remove_at(i)
+	var le := song.get_loop_entry()
+	if i < le:
+		le -= 1
+	le = clampi(le, 0, arr.size() - 1)
+	var changes: Array = [[song, &"entries", arr]]
+	if le != song.loop_entry:
+		changes.append([song, &"loop_entry", le])
+	selected_entry = mini(i, arr.size() - 1)
+	return _song_edit("Remove entry", changes)
+
+## Move entry [param i] one place earlier (-1) or later (1); the loop point stays on
+## the entry it was on. One undo action.
+func move_entry(i: int, dir: int) -> bool:
+	var j := i + dir
+	if song == null or not live or i < 0 or j < 0 or i >= song.entries.size() or j >= song.entries.size():
+		return false
+	var arr: Array[MusicSongEntry] = song.entries.duplicate()
+	var tmp := arr[i]
+	arr[i] = arr[j]
+	arr[j] = tmp
+	var changes: Array = [[song, &"entries", arr]]
+	var le := song.get_loop_entry()
+	if le == i:
+		changes.append([song, &"loop_entry", j])
+	elif le == j:
+		changes.append([song, &"loop_entry", i])
+	selected_entry = j
+	return _song_edit("Move entry", changes)
+
+## Set how many times in a row entry [param i] plays its section. [param merge] folds
+## consecutive edits (spin box clicks) into one undo step.
+func set_entry_repeats(i: int, value: int, merge: bool = false) -> bool:
+	if song == null or i < 0 or i >= song.entries.size() or song.entries[i] == null:
+		return false
+	var e := song.entries[i]
+	if e.repeats == maxi(1, value):
+		return true
+	return _song_edit("Set entry repeats", [[e, &"repeats", maxi(1, value)]], "entry_repeats|%d" % i if merge else "", [e])
+
+## Make entry [param i] the one the song loops back to after its last entry.
+func set_loop_entry(i: int) -> bool:
+	if song == null or i < 0 or i >= song.entries.size() or i == song.get_loop_entry():
+		return false
+	return _song_edit("Set loop point", [[song, &"loop_entry", i]])
+
+# --- Song settings ---------------------------------------------------------
+
+func set_beats_per_bar(value: int, merge: bool = false) -> bool:
+	if song == null or song.beats_per_bar == maxi(1, value):
+		return song != null
+	return _song_edit("Set beats per bar", [[song, &"beats_per_bar", maxi(1, value)]], "beats_per_bar" if merge else "")
+
+## List [param section] in also_bake (null: a new empty section), as one undo action.
+func add_also_bake(section: MusicSection) -> bool:
+	if song == null:
+		return false
+	if section == null:
+		section = MusicSection.create(SynthSongLayout.new_section_name(song))
+	elif song.also_bake.has(section):
+		return false
+	var arr: Array[MusicSection] = song.also_bake.duplicate()
+	arr.append(section)
+	return _song_edit("Add to also_bake", [[song, &"also_bake", arr]])
+
+func remove_also_bake(i: int) -> bool:
+	if song == null or i < 0 or i >= song.also_bake.size():
+		return false
+	var arr: Array[MusicSection] = song.also_bake.duplicate()
+	arr.remove_at(i)
+	return _song_edit("Remove from also_bake", [[song, &"also_bake", arr]])
+
+# --- Sections --------------------------------------------------------------
+
+func set_section_name(section: MusicSection, text: String) -> bool:
+	if song == null or section == null or section.name == text:
+		return song != null
+	return _song_edit("Set section name", [[section, &"name", text]], "", [section])
+
+func set_section_repeats(section: MusicSection, value: int, merge: bool = false) -> bool:
+	if song == null or section == null or section.repeats == maxi(1, value):
+		return song != null
+	return _song_edit("Set section repeats", [[section, &"repeats", maxi(1, value)]],
+			"section_repeats|%d" % section.get_instance_id() if merge else "", [section])
+
+## Give [param section] a progression of its own (on: a copy of the one it plays now,
+## to edit with the block drawer) or take it back to the song's (off), as one undo
+## action. An off section's own progression is dropped (undo gets it back).
+func set_own_progression(section: MusicSection, on: bool) -> bool:
+	if song == null or section == null or (section.progression != null) == on:
+		return song != null
+	if on:
+		var src := section.get_progression(song)
+		var copy := copy_music_data(src) if src != null else SynthPreview.make_default_music_data()
+		copy.bpm = song.bpm
+		_selected_block = -1
+		return _song_edit("Section gets its own progression", [[section, &"progression", copy]], "", [section])
+	_selected_block = -1
+	return _song_edit("Section uses the song's progression", [[section, &"progression", null]], "", [section])
+
+## Set what [param section] does with track [param track_name] (a MusicSectionSlot.Mode).
+## A track with no slot gets one for PLAY or SILENT; Keep on a track with no slot changes
+## nothing.
+func set_slot_mode(section: MusicSection, track_name: StringName, mode: int) -> bool:
+	if song == null or section == null:
+		return false
+	var slot := section.get_slot(track_name)
+	if slot == null:
+		if mode == MusicSectionSlot.Mode.KEEP:
+			return true
+		return _append_slot(section, MusicSectionSlot.create(track_name, mode as MusicSectionSlot.Mode, null), "Set track mode")
+	if int(slot.mode) == mode:
+		return true
+	return _song_edit("Set track mode", [[slot, &"mode", mode]], "", [section, slot])
+
+## Set the pattern (or chain) [param section] plays on track [param track_name]. A track
+## with no slot gets a PLAY slot with it.
+func set_slot_pattern(section: MusicSection, track_name: StringName, pattern: MusicPattern) -> bool:
+	if song == null or section == null:
+		return false
+	var slot := section.get_slot(track_name)
+	if slot == null:
+		return _append_slot(section, MusicSectionSlot.create(track_name, MusicSectionSlot.Mode.PLAY, pattern), "Set track pattern")
+	if slot.pattern == pattern:
+		return true
+	return _song_edit("Set track pattern", [[slot, &"pattern", pattern]], "", [section, slot])
+
+func _append_slot(section: MusicSection, slot: MusicSectionSlot, label: String) -> bool:
+	var arr: Array[MusicSectionSlot] = section.slots.duplicate()
+	arr.append(slot)
+	return _song_edit(label, [[section, &"slots", arr]], "", [section])
+
+## Edit the pattern [param section] plays on [param track_name] (the track's own when the
+## slot has none) in Pattern, hearing it through the track's patch.
+func open_slot_pattern(section: MusicSection, track_name: StringName) -> void:
+	if section == null:
+		return
+	var slot := section.get_slot(track_name)
+	var t: MusicTrack = null
+	for k in tracks:
+		if k.name == track_name:
+			t = k
+			break
+	var p: MusicPattern = slot.pattern if slot != null and slot.pattern != null else (t.pattern if t != null else null)
+	if p != null:
+		pattern_requested.emit(p, t.patch if t != null else null)
+
+# --- Convert and save ------------------------------------------------------
+
+func _convert_tip() -> String:
+	if not live:
+		return "The scene is not open in the editor. Use \"Open scene to edit\"."
+	if scene_data == null or scene_data.blocks.is_empty():
+		return "The scene's player has no MusicData to turn into a song."
+	return "Turn this scene's music into a song: one section \"A\" that plays every track's pattern, over this MusicData and tempo, looping from itself. The scene plays and bakes the same. One undo step."
+
+## Give the scene's player a song made from its MusicData (undoable): the song's
+## progression and tempo are the MusicData's, with one section "A" that has a PLAY
+## slot for every track holding the track's pattern, one entry, looping from it.
+func convert_to_song() -> bool:
+	if not live or song != null or player == null:
+		return false
+	var md := player.get("music_data") as MusicData
+	if md == null or md.blocks.is_empty():
+		return false
+	var made := MusicSong.new()
+	made.bpm = md.bpm
+	made.progression = md
+	var sec := MusicSection.create("A")
+	for t in tracks:
+		sec.add_slot(StringName(t.name), MusicSectionSlot.Mode.PLAY, t.pattern)
+	made.add_entry(sec)
+	selected_entry = 0
+	_edit.set_properties("Convert to song", player, [[player, &"song", made]])
+	_merge_key = ""
+	_sig = ""
+	refresh(true)
+	return true
+
+func _ask_save_song() -> void:
+	if not live or song == null:
+		return
+	var path := SynthSongContext.path_of(song)
+	_song_dialog.current_dir = path.get_base_dir() if path != "" else (scene_path.get_base_dir() if scene_path != "" else "res://")
+	_song_dialog.current_file = path.get_file() if path != "" else "%s_song.tres" % scene_path.get_file().get_basename()
+	_song_dialog.popup_centered()
+
+## Write the song to [param path] (a .tres) and make the player play that file, as one
+## undo action: the file is read back and swapped in, so the scene is marked modified
+## and keeps a reference to it. The song that was there (inline, or from another file)
+## is left as it was. False on failure.
+func save_song_to(path: String) -> bool:
+	if not live or song == null or player == null:
+		return false
+	if not path.ends_with(".tres"):
+		path += ".tres"
+	var err := ResourceSaver.save(song, path)
+	if err != OK:
+		push_error("[SynthTrackView] Save failed: %s (err=%d)" % [path, err])
+		return false
+	var saved := ResourceLoader.load(path, "", ResourceLoader.CACHE_MODE_REPLACE) as MusicSong
+	if saved == null:
+		push_error("[SynthTrackView] Could not read back " + path)
+		return false
+	var ei := _editor_interface()
+	if ei != null:
+		var fs: Object = ei.call("get_resource_filesystem")
+		fs.call("update_file", path)
+		fs.call("scan")
+		ei.call("set_object_edited", saved, false)
+	_edit.set_properties("Save song", player, [[player, &"song", saved]])
+	_merge_key = ""
+	_sig = ""
+	refresh(true)
+	return true

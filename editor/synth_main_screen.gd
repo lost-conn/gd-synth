@@ -600,12 +600,20 @@ static func _saved_path(res: Resource) -> String:
 
 func _refresh_readout() -> void:
 	var d: MusicData = preview.get_effective_music_data()
-	if preview.is_using_default_data():
+	var bpm := d.bpm
+	var song := _track_view.song if _track_view != null else null
+	if song != null:
+		# A song: its tempo, and the progression of the section the Track view shows.
+		bpm = song.bpm
+		var shown := _track_view.get_data()
+		if shown != null and not shown.blocks.is_empty():
+			d = shown
+	if preview.is_using_default_data() and song == null:
 		_data_name.text = "(default)"
 	else:
 		_data_name.text = _saved_path(d).get_file() if _saved_path(d) != "" else "(inline)"
 	_data_default_btn.disabled = preview.is_using_default_data()
-	_bpm_label.text = "%s BPM" % _fmt_bpm(d.bpm)
+	_bpm_label.text = "%s BPM" % _fmt_bpm(bpm)
 	_key_label.text = key_text(d)
 	for c in _prog_chips:
 		c.queue_free()

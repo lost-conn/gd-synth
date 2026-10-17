@@ -93,6 +93,30 @@ static func _find_music_data(node: Node) -> MusicData:
 			return found
 	return null
 
+## The node under [param node] (itself included) that plays music: the first with a
+## [code]song[/code] and [code]music_data[/code] properties (a MusicDataPlayer, also as
+## a placeholder instance).
+## Null when there is none.
+static func find_player(node: Node) -> Node:
+	var has_song := false
+	var has_data := false
+	for p in node.get_property_list():
+		if (p["usage"] & PROPERTY_USAGE_SCRIPT_VARIABLE) != 0:
+			has_song = has_song or p["name"] == "song"
+			has_data = has_data or p["name"] == "music_data"
+	if has_song and has_data:
+		return node
+	for c in node.get_children():
+		var found := find_player(c)
+		if found != null:
+			return found
+	return null
+
+## The MusicSong the scene's player plays (null: a plain MusicData scene).
+static func find_song(node: Node) -> MusicSong:
+	var player := find_player(node)
+	return player.get("song") as MusicSong if player != null else null
+
 ## "" for a resource without a file (inline in the scene).
 static func path_of(res: Resource) -> String:
 	if res == null or res.resource_path == "" or "::" in res.resource_path:

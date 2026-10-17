@@ -18,6 +18,11 @@ signal clip_activated
 ## A step's clip was pressed / double-clicked (index into the chain's steps).
 signal step_pressed(step: int)
 signal step_activated(step: int)
+## With a song: a region of the lane was pressed; [param entry] is its song entry.
+signal region_pressed(entry: int)
+## With a song: a region was double-clicked; [param pattern] is the one it plays or
+## carries on with (null if it plays none).
+signal region_activated(pattern: MusicPattern)
 
 var timeline: SynthTimeline
 var pattern: MusicPattern
@@ -38,8 +43,22 @@ var selected_step: int = -1:
 		selected_step = v
 		queue_redraw()
 
+## With a song: SynthSongLayout.lane_regions() of the track, each with a "tint" (the
+## section's colour) added. Empty: the lane draws its one pattern as before.
+var regions: Array = []:
+	set(v):
+		regions = v
+		queue_redraw()
+## The entry drawn selected in a song (-1 none).
+var selected_entry: int = -1:
+	set(v):
+		selected_entry = v
+		queue_redraw()
+
 # [beat, duration, 0..1 height (1 = highest)]
 var _ticks: Array = []
+# A pattern -> its note picture and clips, for the patterns the regions play.
+var _pics: Dictionary = {}
 # A chain's clips, in play order: {step, repeat, beat, length, label, tip, ticks}.
 var _segs: Array = []
 
@@ -57,11 +76,21 @@ func _notification(what: int) -> void:
 ## (Re)read the pattern into the note picture. Call after anything about the
 ## pattern or the track's type changed.
 func rebuild() -> void:
-	_ticks.clear()
-	_segs.clear()
+	var pic := _picture(pattern)
+	_ticks = pic["ticks"]
+	_segs = pic["segs"]
+	_pics.clear()
+	for r in regions:
+		if r["pattern"] != null and not _pics.has(r["pattern"]):
+			_pics[r["pattern"]] = _picture(r["pattern"])
+	queue_redraw()
+
+# The note picture of [param p] (one tick per note) and, for a chain, its clips.
+func _picture(p: MusicPattern) -> Dictionary:
+	var ticks: Array = []
 	var play_notes: Array[PatternNote] = []
-	if pattern != null:
-		play_notes = pattern.get_play_notes()
+	if p != null:
+		play_notes = p.get_play_notes()
 	if not play_notes.is_empty():
 		var block: MusicBlock = timeline.data.blocks[0] if timeline != null and timeline.data != null and not timeline.data.blocks.is_empty() else null
 		var rpo := SynthPitchMap.rows_per_octave(track_type, block)
@@ -76,28 +105,31 @@ func rebuild() -> void:
 		for i in play_notes.size():
 			var n: PatternNote = play_notes[i]
 			var h := 0.5 if hi == lo else float(rows[i] - lo) / float(hi - lo)
-			_ticks.append([n.beat, n.duration, h])
-	if pattern is PatternChain:
-		_build_segments(pattern as PatternChain)
-	queue_redraw()
+			ticks.append([n.beat, n.duration, h])
+	var segs: Array = []
+	if p is PatternChain:
+		segs = _build_segments(p as PatternChain, ticks)
+	return {"ticks": ticks, "segs": segs}
 
-# The chain's clips, and each one's share of the note picture (the flattened
-# ticks already hold every repeat, transposed and scaled).
-func _build_segments(chain: PatternChain) -> void:
+# The chain's clips, and each one's share of the note picture [param ticks] (the
+# flattened ticks already hold every repeat, transposed and scaled).
+func _build_segments(chain: PatternChain, ticks: Array) -> Array:
+	var segs: Array = []
 	for e in chain.get_step_layout():
 		var step: PatternChainStep = chain.steps[e["step"]]
 		var pname := SynthSongContext.pattern_name(step.pattern)
 		var badges := step_badges(step)
-		_segs.append({"step": e["step"], "repeat": e["repeat"], "beat": e["beat"], "length": e["length"],
+		segs.append({"step": e["step"], "repeat": e["repeat"], "beat": e["beat"], "length": e["length"],
 				"label": pname if badges == "" else "%s  %s" % [pname, badges],
 				"tip": "Step %d: %s%s\n%s beats, repeat %d of %d." % [e["step"] + 1, pname,
 						"" if badges == "" else " (%s)" % badges, e["length"], e["repeat"] + 1, step.repeats],
 				"ticks": []})
-	for t in _ticks:
-		for i in range(_segs.size() - 1, -1, -1):
-			if _segs[i]["beat"] <= t[0] + 0.00001:
-				_segs[i]["ticks"].append(t)
+	for t in ticks:
+		for i in range(segs.size() - 1, -1, -1):
+			if segs[i]["beat"] <= t[0] + 0.00001:
+				segs[i]["ticks"].append(t)
 				break
+	return segs
 
 ## The badges a step's clip shows: "+1 oct" when transposed, "×0.8" when scaled.
 static func step_badges(step: PatternChainStep) -> String:
@@ -164,7 +196,13 @@ func _gui_input(event: InputEvent) -> void:
 	var mb := event as InputEventMouseButton
 	if mb != null and mb.pressed and mb.button_index == MOUSE_BUTTON_LEFT:
 		pressed.emit()
-		if pattern is PatternChain:
+		if timeline != null and timeline.song != null:
+			var ri := region_at(mb.position)
+			if ri >= 0:
+				region_pressed.emit(regions[ri]["entry"])
+				if mb.double_click:
+					region_activated.emit(regions[ri]["pattern"])
+		elif pattern is PatternChain:
 			var hit := _segment_at(mb.position)
 			if hit[0] >= 0:
 				var step: int = _segs[hit[0]]["step"]
@@ -176,6 +214,8 @@ func _gui_input(event: InputEvent) -> void:
 		accept_event()
 
 func _get_tooltip(at_position: Vector2) -> String:
+	if timeline != null and timeline.song != null:
+		return _region_tip(region_at(at_position))
 	if pattern == null:
 		return "This track has no pattern."
 	if pattern is PatternChain:
@@ -187,6 +227,38 @@ func _get_tooltip(at_position: Vector2) -> String:
 	if _clip_at(at_position):
 		return "%s: %s beats, %d notes, repeating.\nDouble-click to edit it in Pattern." % [clip_name, pattern.get_play_length(), pattern.get_play_notes().size()]
 	return ""
+
+## The index in [member regions] of the region at [param pos], or -1.
+func region_at(pos: Vector2) -> int:
+	if timeline == null:
+		return -1
+	for i in regions.size():
+		if pos.x >= timeline.x_of(regions[i]["start"], size.x) and pos.x < timeline.x_of(regions[i]["end"], size.x):
+			return i
+	return -1
+
+## Rect of region [param i], whole height.
+func region_rect(i: int) -> Rect2:
+	var x0 := timeline.x_of(regions[i]["start"], size.x)
+	return Rect2(x0, 0.0, timeline.x_of(regions[i]["end"], size.x) - x0, size.y)
+
+func _region_tip(i: int) -> String:
+	if i < 0:
+		return ""
+	var rg: Dictionary = regions[i]
+	var where := "%s (entry %d)" % [SynthSongLayout.section_label(rg["section"]), int(rg["entry"]) + 1]
+	var pname := SynthSongContext.pattern_name(rg["pattern"]) if rg["pattern"] != null else "none"
+	match int(rg["kind"]):
+		SynthSongLayout.Kind.PLAY:
+			return "%s: plays %s from the section start.\nDouble-click to edit it in Pattern." % [where, pname]
+		SynthSongLayout.Kind.SILENT:
+			return "%s: this track is silent." % where
+	match int(rg["carry"]):
+		SynthSongLayout.Carry.NONE:
+			return "%s: keep. The track is not playing, and nothing starts it yet." % where
+		SynthSongLayout.Carry.SILENT:
+			return "%s: keep. The track stays silent." % where
+	return "%s: keep. The track carries on with %s, without restarting.\nDouble-click to edit it in Pattern." % [where, pname]
 
 func _draw() -> void:
 	var s := SynthRackStyle.scale(self)
@@ -204,7 +276,9 @@ func _draw() -> void:
 		draw_line(Vector2(x, 0), Vector2(x, size.y), Color(grid, grid.a * 2.2), 1.0)
 	var font := SynthRackStyle.font(self)
 	var fs := SynthRackStyle.font_size(self, 0.8)
-	if pattern == null or pattern.get_play_length() <= 0.0:
+	if timeline.song != null:
+		_draw_regions(s, ppb, font, fs)
+	elif pattern == null or pattern.get_play_length() <= 0.0:
 		draw_string(font, Vector2(8.0 * s, size.y * 0.5 + 4.0 * s), "no pattern" if pattern == null else "empty chain",
 				HORIZONTAL_ALIGNMENT_LEFT, size.x - 16.0 * s, fs, SynthRackStyle.dim(self))
 	elif pattern is PatternChain:
@@ -263,3 +337,115 @@ func _draw_chain(s: float, ppb: float, font: Font, fs: int) -> void:
 			if seg["repeat"] == 0 and r.size.x > 34.0 * s:
 				draw_string(font, Vector2(r.position.x + 4.0 * s, r.position.y + fs + 1.0 * s), seg["label"],
 						HORIZONTAL_ALIGNMENT_LEFT, r.size.x - 8.0 * s, fs, Color(1, 1, 1, 0.8 * a))
+
+# ---------------------------------------------------------------------------
+# A song's regions
+# ---------------------------------------------------------------------------
+
+func _draw_regions(s: float, ppb: float, font: Font, fs: int) -> void:
+	var dim := SynthRackStyle.dim(self)
+	var base_alpha := 1.0 if audible else 0.35
+	for i in regions.size():
+		var rg: Dictionary = regions[i]
+		var r := region_rect(i)
+		var tint: Color = rg.get("tint", color)
+		draw_rect(r, Color(tint, 0.10))
+		draw_rect(Rect2(r.position.x, 0.0, r.size.x, 2.0 * s), Color(tint, 0.9))
+		var inner := Rect2(r.position.x + 1.0, 4.0 * s, maxf(1.0, r.size.x - 2.0), maxf(1.0, size.y - 8.0 * s))
+		var label_x := r.position.x + 4.0 * s
+		var wide := r.size.x > 44.0 * s
+		var text := ""
+		match int(rg["kind"]):
+			SynthSongLayout.Kind.PLAY:
+				if rg["pattern"] == null or rg["pattern"].get_play_length() <= 0.0:
+					text = "no pattern"
+				else:
+					_draw_run(rg, inner, color, base_alpha, ppb, s, font, fs, true)
+			SynthSongLayout.Kind.SILENT:
+				_hatch(inner, Color(dim, 0.5 * base_alpha), 7.0 * s)
+				text = "silent"
+			_:
+				match int(rg["carry"]):
+					SynthSongLayout.Carry.NONE:
+						text = "off"
+					SynthSongLayout.Carry.SILENT:
+						_hatch(inner, Color(dim, 0.25 * base_alpha), 9.0 * s)
+						text = "keep: silent"
+					_:
+						if rg["pattern"] == null or rg["pattern"].get_play_length() <= 0.0:
+							text = "keep: no pattern"
+						else:
+							_draw_run(rg, inner, color, base_alpha * 0.45, ppb, s, font, fs, false)
+		if text != "" and wide:
+			draw_string(font, Vector2(label_x, size.y * 0.5 + fs * 0.35), text, HORIZONTAL_ALIGNMENT_LEFT,
+					maxf(0.0, r.size.x - 8.0 * s), fs, Color(dim, dim.a * base_alpha))
+		# The section boundary.
+		draw_line(Vector2(r.position.x, 0), Vector2(r.position.x, size.y), Color(SynthRackStyle.grid(self), 0.5), 1.0)
+		if int(rg["entry"]) == selected_entry:
+			draw_rect(Rect2(r.position.x, 0.0, r.size.x, size.y), Color(SynthRackStyle.accent(self), 0.12))
+
+# The pattern of region [param rg] repeating from its origin, clipped to [param inner].
+# [param labelled]: the first clip of each chain step carries its name (a PLAY region),
+# else "keep" over the first clip.
+func _draw_run(rg: Dictionary, inner: Rect2, col: Color, alpha: float, ppb: float, s: float, font: Font, fs: int, labelled: bool) -> void:
+	var p: MusicPattern = rg["pattern"]
+	var pic: Dictionary = _pics.get(p, {})
+	if pic.is_empty():
+		return
+	var length := p.get_play_length()
+	var origin: float = rg["origin"]
+	var rstart: float = rg["start"]
+	var rend: float = rg["end"]
+	var segs: Array = pic["segs"]
+	var plain := segs.is_empty()
+	if plain:
+		segs = [{"step": 0, "repeat": 0, "beat": 0.0, "length": length, "label": SynthSongContext.pattern_name(p), "ticks": pic["ticks"]}]
+	var trip := int(floorf((rstart - origin) / length))
+	var labelled_keep := false
+	while origin + float(trip) * length < rend - 0.0001:
+		var tstart := origin + float(trip) * length
+		for seg in segs:
+			var a: float = tstart + seg["beat"]
+			var b: float = a + seg["length"]
+			if b <= rstart + 0.0001 or a >= rend - 0.0001:
+				continue
+			var x0 := maxf(timeline.x_of(a, size.x), inner.position.x)
+			var x1 := minf(timeline.x_of(b, size.x), inner.end.x)
+			if x1 <= x0:
+				continue
+			var c := col if int(seg["step"]) % 2 == 0 else col.lightened(0.22)
+			var a2 := alpha * (1.0 if seg["repeat"] == 0 else 0.6)
+			var cr := Rect2(x0, inner.position.y, x1 - x0, inner.size.y)
+			draw_rect(cr, Color(c, 0.22 * a2))
+			draw_rect(cr, Color(c, 0.85 * a2), false, 1.0)
+			var tin := cr.grow(-3.0 * s)
+			var nh := clampf(tin.size.y / 12.0, 2.0, 4.0 * s)
+			for t in seg["ticks"]:
+				var nb: float = tstart + t[0]
+				if nb < rstart - 0.0001 or nb >= rend - 0.0001:
+					continue
+				var bx := maxf(timeline.x_of(nb, size.x), cr.position.x)    # a note on the first beat sits in the clip's inset
+				if bx >= cr.end.x - 0.5:
+					continue
+				var w := minf(maxf(1.0, t[1] * ppb), cr.end.x - bx - 1.0)
+				var y: float = tin.position.y + (1.0 - t[2]) * (tin.size.y - nh)
+				draw_rect(Rect2(bx, y, maxf(1.0, w), nh), Color(c.lightened(0.25), 0.95 * a2))
+			if labelled and seg["repeat"] == 0 and cr.size.x > 34.0 * s and (not plain or a >= rstart - 0.0001):
+				draw_string(font, Vector2(cr.position.x + 4.0 * s, cr.position.y + fs + 1.0 * s), seg["label"],
+						HORIZONTAL_ALIGNMENT_LEFT, cr.size.x - 8.0 * s, fs, Color(1, 1, 1, 0.8 * alpha))
+			elif not labelled and not labelled_keep and cr.size.x > 34.0 * s:
+				labelled_keep = true
+				draw_string(font, Vector2(cr.position.x + 4.0 * s, cr.position.y + fs + 1.0 * s), "keep",
+						HORIZONTAL_ALIGNMENT_LEFT, cr.size.x - 8.0 * s, fs, Color(1, 1, 1, 0.9))
+		trip += 1
+
+# Diagonal lines across [param r], clipped to it.
+func _hatch(r: Rect2, col: Color, step: float) -> void:
+	var h := r.size.y
+	var d := r.position.x - h
+	while d < r.end.x:
+		var t0 := maxf(0.0, (r.position.x - d) / h)
+		var t1 := minf(1.0, (r.end.x - d) / h)
+		if t1 > t0:
+			draw_line(Vector2(d + t0 * h, r.end.y - t0 * h), Vector2(d + t1 * h, r.end.y - t1 * h), col, 1.0)
+		d += step

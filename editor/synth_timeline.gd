@@ -10,6 +10,27 @@ extends RefCounted
 var span: float = 8.0
 ## The progression the timeline sits over (null: none).
 var data: MusicData
+## The song whose sections the timeline lays end to end (null: a plain scene, where
+## [member data] repeats across the span). Set it with [method set_song].
+var song: MusicSong
+## SynthSongLayout.segments() of [member song].
+var segments: Array = []
+
+## Lay [param s] out (null: back to a plain progression). The span becomes the length
+## of one pass of the song.
+func set_song(s: MusicSong) -> void:
+	song = s
+	segments = SynthSongLayout.segments(s)
+	if s != null:
+		var length := s.get_length_beats()
+		span = length if length > 0.0 else 8.0
+
+## The segment of [member segments] that [param beat] falls in, or -1.
+func segment_at(beat: float) -> int:
+	for i in segments.size():
+		if beat >= segments[i]["start"] - 0.0001 and beat < segments[i]["start"] + segments[i]["length"] - 0.0001:
+			return i
+	return -1
 
 func x_of(beat: float, width: float) -> float:
 	return beat / maxf(span, 0.001) * width
@@ -22,9 +43,13 @@ func progression_beats() -> float:
 	return float(SynthHarmony.progression_beats(data))
 
 ## [beat, block index, block] for every block start inside the span, the
-## progression repeating. Empty without data.
+## progression repeating. Empty without data. With a song: each section's own
+## progression (its repeats in a row) end to end, and the entries have two more
+## elements, [MusicData, segment index], and the section repeat after that.
 func block_starts() -> Array:
 	var out: Array = []
+	if song != null:
+		return _song_block_starts()
 	if data == null or data.blocks.is_empty():
 		return out
 	var total := progression_beats()
@@ -44,3 +69,25 @@ func block_starts() -> Array:
 static func choose_span(prog_beats: float, longest_pattern: float) -> float:
 	var prog_span := 2.0 * prog_beats if prog_beats > 0.0 else 8.0
 	return maxf(prog_span, longest_pattern)
+
+func _song_block_starts() -> Array:
+	var out: Array = []
+	for si in segments.size():
+		var seg: Dictionary = segments[si]
+		var d: MusicData = seg["progression"]
+		if d == null:
+			continue
+		var section: MusicSection = seg["section"]
+		var t: float = seg["start"]
+		for rep in maxi(1, section.repeats):
+			for i in d.blocks.size():
+				out.append([t, i, d.blocks[i], d, si, rep])
+				t += float(d.blocks[i].duration_beats)
+	return out
+
+## [param total] (the director's beat) on this timeline: the song's, folded into its
+## loop after one pass; a plain scene's wrapped at the span.
+func cursor_of(total: float) -> float:
+	if song != null:
+		return SynthSongLayout.fold(song, total)
+	return fposmod(total, span)

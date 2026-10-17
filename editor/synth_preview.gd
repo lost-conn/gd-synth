@@ -8,7 +8,9 @@ extends Node
 #
 # A whole song (the Track view's Play) uses the same engine and director with one
 # more MusicTrack per lane, built by play_song(): see "Whole song" below. The
-# single track above stays the Pattern view's.
+# single track above stays the Pattern view's. A scene whose player has a MusicSong
+# is played by play_music_song(), through a real MusicDataPlayer over the same rig,
+# so sections, slots, loops and seeks follow the game's own code.
 #
 # It never touches the game's /root/Synth or /root/Music autoloads: the track is
 # handed its director and synth before it enters the tree and has autoplay off,
@@ -65,9 +67,14 @@ var loop: bool = true
 ## The song's tracks while a whole song is on (play_song), one per lane in the
 ## order given. Empty otherwise.
 var song_tracks: Array[MusicTrack] = []
+## The real MusicDataPlayer playing a MusicSong over the preview's director and the
+## song tracks (play_music_song). Built on first use, kept after Stop.
+var song_player: MusicDataPlayer
 
 var _suspended: bool = false
 var _song_on: bool = false
+var _music_song: MusicSong
+var _song_end_beat: float = -1.0
 var _song_audible: Array[bool] = []
 # Auditioned notes still held: midi -> the engine that started them.
 var _held: Dictionary = {}
@@ -174,6 +181,7 @@ func is_suspended() -> bool:
 ## Stop everything and free the rig. After this ensure_started() builds a new one.
 func shutdown() -> void:
 	stop()
+	_free_song_player()
 	_free_song_tracks()
 	for n in [track, director, synth, sampler]:
 		if n != null and is_instance_valid(n):
@@ -462,6 +470,14 @@ func set_song_lane_audible(i: int, audible: bool) -> void:
 		return
 	_song_audible[i] = audible
 	var t := song_tracks[i]
+	if is_music_song_on():
+		# The song decides what each track plays: a lane that comes back takes its
+		# place by re-seeking the song where it is, and one that goes is just stopped.
+		if audible:
+			song_player.seek(director.get_total_beats())
+		else:
+			t.deactivate()
+		return
 	if audible:
 		t.sync_to_director = true
 		t.activate()
@@ -504,6 +520,7 @@ func active_voices_by_channel() -> Dictionary:
 	return out
 
 func _stop_song_tracks() -> void:
+	_end_music_song()
 	for t in song_tracks:
 		if is_instance_valid(t):
 			t.deactivate()
@@ -522,6 +539,7 @@ func _free_song_tracks() -> void:
 	_song_audible.clear()
 
 func stop() -> void:
+	_end_music_song()
 	if director != null:
 		director.stop()
 	if track != null:
@@ -542,6 +560,103 @@ func stop() -> void:
 	_held_kit.clear()
 	_restore_shared_patch()
 	_sync_playing()
+
+# ---------------------------------------------------------------------------
+# Whole song, from a MusicSong
+# ---------------------------------------------------------------------------
+
+## Play [param song] with the real [MusicDataPlayer] over this rig: one MusicTrack per
+## lane in [param lanes] (as for play_song, plus name: the MusicTrack's node name the
+## sections' slots refer to, and active: whether the track is playing before the song
+## touches it, the scene's autoplay), starting at entry [param entry], or at
+## [param start_beat] of the song's timeline when that is given. Mute and solo
+## (a lane's audible) keep a lane stopped whatever the song says.
+func play_music_song(song: MusicSong, lanes: Array, entry: int = 0, start_beat: float = -1.0) -> void:
+	if _suspended or song == null:
+		return
+	ensure_started()
+	stop()
+	_free_song_player()
+	_free_song_tracks()
+	_song_on = true
+	_song_audible.clear()
+	var used := {}
+	for spec in lanes:
+		var t := MusicTrack.new()
+		var nm := String(spec.get("name", ""))
+		t.name = nm if nm != "" and not used.has(nm) else "SongTrack%d" % song_tracks.size()
+		used[nm] = true
+		t.editor_preview = true
+		t.director = director
+		t.synth = synth
+		t.autoplay = false
+		t.track_type = int(spec.get("type", MusicTrack.TrackType.CHORD))
+		t.pattern = spec.get("pattern")
+		t.patch = spec.get("patch") if spec.get("patch") != null else get_effective_patch()
+		t.synth_channel = clampi(int(spec.get("channel", 0)), 0, 15)
+		t.base_octave = int(spec.get("base_octave", 4))
+		t.pan = float(spec.get("pan", 0.0))
+		t.kit = spec.get("kit")
+		t.swap_mode = MusicDirector.SwapMode.IMMEDIATE
+		# A track no section names plays on the timeline like the lane draws it; the
+		# ones the song drives are started exactly by the player.
+		t.sync_to_director = true
+		add_child(t)
+		song_tracks.append(t)
+		_song_audible.append(bool(spec.get("audible", true)))
+	for i in song_tracks.size():
+		song_tracks[i].apply_patches()
+		if bool(lanes[i].get("active", true)):
+			song_tracks[i].activate()
+	_music_song = song
+	song_player = MusicDataPlayer.new()
+	song_player.name = "SongPlayer"
+	song_player.editor_preview = true
+	song_player.director = director
+	song_player.song = song
+	song_player.section_changed.connect(_on_music_section_changed)
+	add_child(song_player)
+	_song_end_beat = song.get_length_beats()
+	_end_beat = _song_end_beat
+	song_player.play_from_section(entry)
+	if start_beat >= 0.0 and not is_equal_approx(start_beat, song.entry_start(entry)):
+		song_player.seek(start_beat)
+	_sync_playing()
+
+## True while a MusicSong plays through [member song_player].
+func is_music_song_on() -> bool:
+	return _song_on and song_player != null and is_instance_valid(song_player) and song_player.is_song_playing()
+
+## The song [member song_player] plays now (null: none).
+func get_music_song() -> MusicSong:
+	return _music_song if is_music_song_on() else null
+
+## Loop section [param which] (an entry index, as MusicDataPlayer.set_loop_section), or
+## release it with -1. While one loops, the one-shot end of Loop-off does not stop it.
+func set_loop_section(which: Variant) -> void:
+	if not is_music_song_on():
+		return
+	song_player.set_loop_section(which)
+	_end_beat = _song_end_beat if song_player.get_loop_section() == null else -1.0
+
+# A section started: a muted or un-soloed lane stays stopped, whatever the section's
+# PLAY slot just did to it.
+func _on_music_section_changed(_section: MusicSection, _entry: int) -> void:
+	for i in song_tracks.size():
+		if not _song_audible[i] and is_instance_valid(song_tracks[i]):
+			song_tracks[i].deactivate()
+
+func _end_music_song() -> void:
+	if song_player != null and is_instance_valid(song_player):
+		song_player.stop()
+
+func _free_song_player() -> void:
+	if song_player != null and is_instance_valid(song_player):
+		if song_player.get_parent() == self:
+			remove_child(song_player)
+		song_player.free()
+	song_player = null
+	_music_song = null
 
 func _process(_delta: float) -> void:
 	if director == null:
