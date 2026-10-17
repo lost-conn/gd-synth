@@ -39,6 +39,7 @@ static var deep_check: bool = Engine.is_editor_hint()
 
 var _cache_notes: Array[PatternNote] = []
 var _cache_length: float = 0.0
+var _cache_layout: Array = []
 var _cache_key: int = 0
 var _cache_valid: bool = false
 
@@ -77,6 +78,15 @@ func get_play_length() -> float:
 	_refresh()
 	return _cache_length
 
+## Where each step plays within one trip through the chain: one Dictionary per
+## repeat of every step that plays something, in order: [code]step[/code] (index
+## into [member steps]), [code]repeat[/code] (0-based), [code]beat[/code] and
+## [code]length[/code]. A step with no pattern, no length or a cycle is absent.
+## For the Track view's clips; cached with the notes, do not change it.
+func get_step_layout() -> Array:
+	_refresh()
+	return _cache_layout
+
 func _refresh() -> void:
 	var key: int = _fingerprint()
 	if _cache_valid and key == _cache_key:
@@ -84,6 +94,7 @@ func _refresh() -> void:
 	var built: Array = _build([self])
 	_cache_notes = built[0]
 	_cache_length = built[1]
+	_cache_layout = built[2]
 	_cache_key = key
 	_cache_valid = true
 	# Only for code that reads the raw field; the accessors are the contract.
@@ -95,11 +106,13 @@ func _refresh() -> void:
 
 ## Flatten this chain. [param stack] holds the chains being flattened above it
 ## (itself included); a step reaching one of them would loop forever and is
-## skipped. Returns [Array[PatternNote], length].
+## skipped. Returns [Array[PatternNote], length, step layout].
 func _build(stack: Array) -> Array:
 	var out: Array[PatternNote] = []
+	var layout: Array = []
 	var pos: float = 0.0
-	for step in steps:
+	for si in steps.size():
+		var step: PatternChainStep = steps[si]
 		if step == null or step.pattern == null:
 			continue
 		var p: MusicPattern = step.pattern
@@ -119,12 +132,13 @@ func _build(stack: Array) -> Array:
 			plen = p.get_play_length()
 		if plen <= 0.0:
 			continue
-		for _r in maxi(1, step.repeats):
+		for r in maxi(1, step.repeats):
+			layout.append({"step": si, "repeat": r, "beat": pos, "length": plen})
 			for n in src:
 				# A plain pattern plays a note at its beat modulo its length.
 				out.append(_copy_note(n, pos + fposmod(n.beat, plen), step.octave_shift, step.velocity_scale))
 			pos += plen
-	return [out, pos]
+	return [out, pos, layout]
 
 static func _copy_note(n: PatternNote, beat: float, octave_shift: int, velocity_scale: float) -> PatternNote:
 	var c := PatternNote.new()

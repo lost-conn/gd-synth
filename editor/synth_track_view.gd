@@ -12,7 +12,8 @@ extends VBoxContainer
 #   ruler       beats and bars; click or drag to move the playhead
 #   lanes       one per MusicTrack: name, type, mute and solo, and its pattern as
 #               a clip repeating across the timeline (two trips through the
-#               progression, or the longest pattern if that is longer)
+#               progression, or the longest pattern if that is longer); a
+#               PatternChain is drawn as one clip per step
 #   drawer      the selected block's chord, scale and length, and add / move / remove
 #   inspector   the selected track's own settings, collapsible
 #
@@ -36,8 +37,9 @@ signal scene_changed(path: String)
 ## What the Pattern view should know about the song changed: the tracks as the view
 ## sees them now (null = no scene).
 signal song_context_changed(ctx: SynthSongContext)
-## A clip was double-clicked: edit [param pattern] in Pattern, hearing it through
-## [param patch] (null if the track has none).
+## A clip (or a chain's step clip, or the Open in Pattern button) was activated:
+## edit [param pattern] in Pattern, hearing it through [param patch] (null if the
+## track has none).
 signal pattern_requested(pattern: MusicPattern, patch: SynthPatch)
 ## Edit [param patch] in Sound.
 signal patch_requested(patch: SynthPatch)
@@ -65,6 +67,8 @@ var tracks: Array[MusicTrack] = []
 var scene_data: MusicData
 var timeline := SynthTimeline.new()
 var selected_path: String = ""
+## The step of the selected track's chain shown selected (-1 none).
+var selected_step: int = -1
 var muted: Dictionary = {}
 var soloed: Dictionary = {}
 
@@ -133,6 +137,9 @@ var _drawer_labels: Array = []
 var _blk_add: Button
 var _inspector: SynthTrackInspector
 var _dialog: FileDialog
+var _chain_dialog: FileDialog
+var _chain_save_track: String = ""
+var _merge_key: String = ""
 var _timer: Timer
 
 # ---------------------------------------------------------------------------
@@ -381,6 +388,13 @@ func _build_body() -> void:
 			patch_requested.emit(tracks[i].patch))
 	_inspector.remove_requested.connect(remove_selected_track)
 	_inspector.match_requested.connect(func(): match_pattern_type(_selected_index()))
+	_inspector.step_edited.connect(func(step: int, prop: StringName, value: Variant, merge: bool):
+		set_step_property(_selected_index(), step, prop, value, merge))
+	_inspector.step_action.connect(_on_step_action)
+	_inspector.step_selected.connect(select_step)
+	_inspector.make_chain_requested.connect(func(): make_chain(_selected_index()))
+	_inspector.unwrap_chain_requested.connect(func(): unwrap_chain(_selected_index()))
+	_inspector.save_chain_requested.connect(_ask_save_chain)
 	body.add_child(_inspector)
 
 func _build_drawer(parent: Control) -> void:
@@ -474,6 +488,13 @@ func _build_dialogs() -> void:
 	_dialog.size = Vector2i(720, 520)
 	_dialog.file_selected.connect(func(p: String): set_scene(p))
 	add_child(_dialog)
+	_chain_dialog = FileDialog.new()
+	_chain_dialog.file_mode = FileDialog.FILE_MODE_SAVE_FILE
+	_chain_dialog.access = FileDialog.ACCESS_RESOURCES
+	_chain_dialog.filters = PackedStringArray(["*.tres ; Pattern Chain Resource"])
+	_chain_dialog.size = Vector2i(720, 520)
+	_chain_dialog.file_selected.connect(_on_chain_path_chosen)
+	add_child(_chain_dialog)
 
 # Editor-theme icons when the editor theme is inherited; the plain text anywhere else.
 func _apply_icons() -> void:
@@ -733,6 +754,14 @@ func _res_sig(r: Resource) -> String:
 		for n in play_notes:
 			acc += n.beat * 7.0 + n.duration * 3.0 + float(n.index) * 13.0 + float(n.octave) * 17.0
 		s += ":%s:%d:%s:%d" % [p.get_play_length(), play_notes.size(), acc, int(p.editor_track_type)]
+	var chain := r as PatternChain
+	if chain != null:
+		# What the steps say, which the notes do not always show (velocity, a null step,
+		# the types they are marked with).
+		s += ":h%s" % [SynthSongContext.hints(chain)]
+		for step in chain.steps:
+			s += ";-" if step == null else ";%s,%d,%d,%s" % [step.pattern.get_instance_id() if step.pattern != null else 0,
+					step.repeats, step.octave_shift, step.velocity_scale]
 	return s
 
 func _on_poll() -> void:
@@ -839,10 +868,13 @@ func _rebuild_lanes() -> void:
 		var path := _track_path(t)
 		lane.selected.connect(_select_path.bind(path))
 		lane.clip_activated.connect(func(): _open_pattern_of(_index_of_path(path)))
+		lane.step_pressed.connect(func(step: int): select_step(step))
+		lane.step_activated.connect(func(step: int): open_step_pattern(_index_of_path(path), step))
 		lane.mute_toggled.connect(func(on: bool): _set_mute(path, on))
 		lane.solo_toggled.connect(func(on: bool): _set_solo(path, on))
 		lane.set_selected(path == selected_path)
 		_lanes.append(lane)
+	_sync_step_highlight()
 	_apply_audibility(false)
 	_empty_label.visible = tracks.is_empty()
 	if scene_path == "":
@@ -920,11 +952,21 @@ func _refresh_inspector() -> void:
 		if info != null:
 			bake = "Bake: %s." % info.chip_text().to_lower().replace("bake ", "")
 	var match_tip := "The scene is not open in the editor, so its tracks are read-only. Use \"Open scene to edit\"."
+	var can_match := true
 	if live and t.pattern != null:
-		match_tip = "Set this track's type to %s, like its pattern (undoable)." % SynthPitchMap.type_name(int(t.pattern.editor_track_type))
+		var want := SynthSongContext.match_type(t.pattern)
+		var chain := t.pattern as PatternChain
+		match_tip = "Set this track's type to %s, like its %s (undoable)." % [SynthPitchMap.type_name(want),
+				"first marked step" if chain != null and chain.editor_track_type == MusicPattern.EditorTrackType.AUTO else "pattern"]
+		if want == int(t.track_type):
+			can_match = false
+			match_tip = "The track already has the type the pattern is marked with. A step is marked with another: change it in Pattern."
+	if chain_of(i) == null or selected_step >= chain_of(i).steps.size():
+		selected_step = -1
 	_inspector.show_track(t, {
 		"editable": live, "path": _track_path(t), "can_remove": can_remove, "remove_tip": tip, "bake": bake,
 		"clash": SynthSongContext.clash_text(t.pattern, int(t.track_type)), "match_tip": match_tip,
+		"can_match": can_match, "selected_step": selected_step,
 		"banner": "" if live else "Read-only: the scene is not open in the editor. Use \"Open scene to edit\".",
 	})
 
@@ -995,9 +1037,12 @@ func _index_of_path(path: String) -> int:
 	return -1
 
 func _select_path(path: String) -> void:
+	if path != selected_path:
+		selected_step = -1
 	selected_path = path
 	for i in _lanes.size():
 		_lanes[i].set_selected(_track_path(tracks[i]) == path)
+	_sync_step_highlight()
 	_refresh_inspector()
 
 ## Select lane [param i].
@@ -1009,6 +1054,26 @@ func _open_pattern_of(i: int) -> void:
 	if i < 0 or i >= tracks.size() or tracks[i].pattern == null:
 		return
 	pattern_requested.emit(tracks[i].pattern, tracks[i].patch)
+
+## Select step [param step] of the selected track's chain: its clips and its row
+## in the inspector are marked.
+func select_step(step: int) -> void:
+	selected_step = step
+	_sync_step_highlight()
+	_inspector.select_step(step)
+
+# Only the selected track's clips show a selected step.
+func _sync_step_highlight() -> void:
+	for i in _lanes.size():
+		_lanes[i].clips.selected_step = selected_step if _track_path(tracks[i]) == selected_path else -1
+
+## Edit the pattern of step [param step] of lane [param i]'s chain in Pattern, hearing
+## it through the track's patch.
+func open_step_pattern(i: int, step: int) -> void:
+	var chain := chain_of(i)
+	if chain == null or step < 0 or step >= chain.steps.size() or chain.steps[step] == null or chain.steps[step].pattern == null:
+		return
+	pattern_requested.emit(chain.steps[step].pattern, tracks[i].patch)
 
 # ---------------------------------------------------------------------------
 # Mute and solo
@@ -1195,13 +1260,13 @@ func set_track_property(i: int, prop: StringName, value: Variant, merge: bool = 
 	refresh(true)
 	return true
 
-## Set lane [param i]'s track type to the one its pattern is marked with, as one
-## undo action on the scene (the inspector's Type menu does the same). False if
+## Set lane [param i]'s track type to the one its pattern is marked with (a chain
+## that is Auto: its first marked step), as one undo action on the scene (the inspector's Type menu does the same). False if
 ## the scene is not open or there is nothing to match.
 func match_pattern_type(i: int) -> bool:
 	if i < 0 or i >= tracks.size() or not SynthSongContext.clash(tracks[i].pattern, int(tracks[i].track_type)):
 		return false
-	return set_track_property(i, &"track_type", int(tracks[i].pattern.editor_track_type))
+	return set_track_property(i, &"track_type", SynthSongContext.match_type(tracks[i].pattern))
 
 ## Set the type of the tracks named [param names] (paths from the scene's root, as
 ## in SynthSongContext.tracks) of the scene at [param scene] to [param type], as one
@@ -1225,6 +1290,188 @@ func match_track_types(scene: String, names: Array, type: int) -> bool:
 		if scene == scene_path:
 			refresh(true)
 	return found
+
+# ---------------------------------------------------------------------------
+# Editing chains (the PatternChain a track plays)
+#
+# Every change is one action in the scene's history with the TRACK as its context,
+# so Ctrl+Z, the scene's modified mark and Ctrl+S work whether the chain is inline
+# in the scene or lives in a .tres of its own. A step's own property is set on the
+# step; adding, removing, moving or duplicating steps replaces the chain's steps
+# with a modified copy. The chain is told it changed afterwards (do and undo).
+# ---------------------------------------------------------------------------
+
+const STEP_PROPS := {&"pattern": "pattern", &"repeats": "repeats", &"octave_shift": "octave", &"velocity_scale": "velocity"}
+
+## The chain lane [param i] plays, or null.
+func chain_of(i: int) -> PatternChain:
+	return tracks[i].pattern as PatternChain if i >= 0 and i < tracks.size() else null
+
+# One action on lane [param i]'s track. [param merge_key] non-empty: fold into the
+# previous action if it had the same key (spin box clicks on one property).
+func _chain_edit(label: String, i: int, changes: Array, merge_key: String = "") -> bool:
+	var chain := chain_of(i)
+	if not live or chain == null:
+		_refresh_inspector()   # a read-only panel snaps back to what the chain holds
+		return false
+	_edit.set_properties(label, tracks[i], changes, merge_key != "" and merge_key == _merge_key, [chain])
+	_merge_key = merge_key
+	# A chain in a file of its own is changed, and not saved yet.
+	var ei := _editor_interface()
+	if ei != null and SynthSongContext.path_of(chain) != "":
+		ei.call("set_object_edited", chain, true)
+	refresh(true)
+	return true
+
+## Set [param prop] (pattern, repeats, octave_shift, velocity_scale) of step
+## [param step] of lane [param i]'s chain, as one undo action. [param merge] folds
+## consecutive edits of the same property (spin box clicks) into one.
+func set_step_property(i: int, step: int, prop: StringName, value: Variant, merge: bool = false) -> bool:
+	var chain := chain_of(i)
+	if not live or chain == null or step < 0 or step >= chain.steps.size() or chain.steps[step] == null \
+			or not STEP_PROPS.has(prop):
+		_refresh_inspector()
+		return false
+	var st := chain.steps[step]
+	if st.get(prop) == value:
+		return true
+	selected_step = step
+	return _chain_edit("Set step %d %s" % [step + 1, STEP_PROPS[prop]], i, [[st, prop, value]],
+			"%s|%d|%s" % [_track_path(tracks[i]), step, prop] if merge else "")
+
+# Replace lane [param i]'s chain steps, selecting [param select] afterwards.
+func _set_steps(label: String, i: int, arr: Array[PatternChainStep], select: int) -> bool:
+	var chain := chain_of(i)
+	if not live or chain == null:
+		_refresh_inspector()
+		return false
+	selected_step = select
+	return _chain_edit(label, i, [[chain, &"steps", arr]])
+
+## Add an empty step at the end of lane [param i]'s chain.
+func add_chain_step(i: int) -> bool:
+	var chain := chain_of(i)
+	if chain == null:
+		return false
+	var arr: Array[PatternChainStep] = chain.steps.duplicate()
+	arr.append(PatternChainStep.new())
+	return _set_steps("Add chain step", i, arr, arr.size() - 1)
+
+## Remove step [param step] of lane [param i]'s chain.
+func remove_chain_step(i: int, step: int) -> bool:
+	var chain := chain_of(i)
+	if chain == null or step < 0 or step >= chain.steps.size():
+		return false
+	var arr: Array[PatternChainStep] = chain.steps.duplicate()
+	arr.remove_at(step)
+	return _set_steps("Remove chain step", i, arr, mini(step, arr.size() - 1))
+
+## Move step [param step] of lane [param i]'s chain one place earlier (-1) or later (1).
+func move_chain_step(i: int, step: int, dir: int) -> bool:
+	var chain := chain_of(i)
+	var to := step + dir
+	if chain == null or step < 0 or step >= chain.steps.size() or to < 0 or to >= chain.steps.size():
+		return false
+	var arr: Array[PatternChainStep] = chain.steps.duplicate()
+	var moved := arr[step]
+	arr.remove_at(step)
+	arr.insert(to, moved)
+	return _set_steps("Move chain step", i, arr, to)
+
+## Add a copy of step [param step] right after it (the pattern is shared, not copied).
+func duplicate_chain_step(i: int, step: int) -> bool:
+	var chain := chain_of(i)
+	if chain == null or step < 0 or step >= chain.steps.size() or chain.steps[step] == null:
+		return false
+	var src := chain.steps[step]
+	var arr: Array[PatternChainStep] = chain.steps.duplicate()
+	arr.insert(step + 1, PatternChainStep.create(src.pattern, src.repeats, src.octave_shift, src.velocity_scale))
+	return _set_steps("Duplicate chain step", i, arr, step + 1)
+
+func _on_step_action(action: StringName, step: int) -> void:
+	var i := _selected_index()
+	match action:
+		&"add":
+			add_chain_step(i)
+		&"remove":
+			remove_chain_step(i, step)
+		&"up":
+			move_chain_step(i, step, -1)
+		&"down":
+			move_chain_step(i, step, 1)
+		&"duplicate":
+			duplicate_chain_step(i, step)
+		&"open":
+			open_step_pattern(i, step)
+
+## Wrap lane [param i]'s pattern in a new chain with one step, as one undo action.
+## The chain is inline in the scene until saved with [method save_chain_to].
+func make_chain(i: int) -> bool:
+	if not live or i < 0 or i >= tracks.size() or tracks[i].pattern == null or tracks[i].pattern is PatternChain:
+		return false
+	var t := tracks[i]
+	selected_step = -1
+	_edit.set_properties("Make chain", t, [[t, &"pattern", PatternChain.new().add_step(t.pattern)]])
+	_merge_key = ""
+	refresh(true)
+	return true
+
+## Replace lane [param i]'s one-step chain with that step's pattern (its repeats,
+## octave and velocity are dropped), as one undo action.
+func unwrap_chain(i: int) -> bool:
+	var chain := chain_of(i)
+	if not live or chain == null or chain.steps.size() != 1 or chain.steps[0] == null or chain.steps[0].pattern == null:
+		return false
+	var t := tracks[i]
+	selected_step = -1
+	_edit.set_properties("Use pattern", t, [[t, &"pattern", chain.steps[0].pattern]])
+	_merge_key = ""
+	refresh(true)
+	return true
+
+func _ask_save_chain() -> void:
+	var i := _selected_index()
+	var chain := chain_of(i)
+	if not live or chain == null:
+		return
+	var path := SynthSongContext.path_of(chain)
+	_chain_save_track = _track_path(tracks[i])
+	_chain_dialog.current_dir = path.get_base_dir() if path != "" else (scene_path.get_base_dir() if scene_path != "" else "res://")
+	_chain_dialog.current_file = path.get_file() if path != "" else "%s_chain.tres" % String(tracks[i].name).to_snake_case()
+	_chain_dialog.popup_centered()
+
+func _on_chain_path_chosen(path: String) -> void:
+	save_chain_to(_index_of_path(_chain_save_track), path)
+
+## Write lane [param i]'s chain to [param path] (a .tres) and make the track play
+## that file, as one undo action: the file is read back and swapped in, so the
+## scene is marked modified and keeps a reference to it. The chain that was there
+## (inline, or from another file) is left as it was. False on failure.
+func save_chain_to(i: int, path: String) -> bool:
+	var chain := chain_of(i)
+	if not live or chain == null:
+		return false
+	if not path.ends_with(".tres"):
+		path += ".tres"
+	var err := ResourceSaver.save(chain, path)
+	if err != OK:
+		push_error("[SynthTrackView] Save failed: %s (err=%d)" % [path, err])
+		return false
+	var saved := ResourceLoader.load(path, "", ResourceLoader.CACHE_MODE_REPLACE) as PatternChain
+	if saved == null:
+		push_error("[SynthTrackView] Could not read back " + path)
+		return false
+	var ei := _editor_interface()
+	if ei != null:
+		var fs: Object = ei.call("get_resource_filesystem")
+		fs.call("update_file", path)
+		fs.call("scan")
+		ei.call("set_object_edited", saved, false)
+	var t := tracks[i]
+	_edit.set_properties("Save chain", t, [[t, &"pattern", saved]])
+	_merge_key = ""
+	refresh(true)
+	return true
 
 ## Add a MusicTrack to the scene (next to the others), as one undo action.
 func add_track() -> void:

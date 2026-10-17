@@ -7,6 +7,9 @@ extends HBoxContainer
 
 signal selected
 signal clip_activated
+## A step clip of a chain was pressed / double-clicked.
+signal step_pressed(step: int)
+signal step_activated(step: int)
 signal mute_toggled(on: bool)
 signal solo_toggled(on: bool)
 
@@ -82,6 +85,8 @@ func _ready() -> void:
 	clips.size_flags_horizontal = Control.SIZE_EXPAND_FILL
 	clips.pressed.connect(func(): selected.emit())
 	clips.clip_activated.connect(func(): clip_activated.emit())
+	clips.step_pressed.connect(func(i: int): step_pressed.emit(i))
+	clips.step_activated.connect(func(i: int): step_activated.emit(i))
 	add_child(clips)
 	_restyle()
 

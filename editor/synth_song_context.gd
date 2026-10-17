@@ -91,25 +91,44 @@ static func path_of(res: Resource) -> String:
 		return ""
 	return res.resource_path
 
-## The track (a Dictionary) that plays [param pattern], or {}. Matches by object,
-## then by file.
+## The track (a Dictionary) that plays [param pattern], or {}. A track that plays
+## it directly comes before one that plays a chain with it as a step.
 func track_for(pattern: MusicPattern) -> Dictionary:
-	if pattern == null:
-		return {}
-	var path := path_of(pattern)
-	for t in tracks:
-		if t["pattern"] == pattern or (path != "" and t["pattern_path"] == path):
-			return t
-	return {}
+	var all := tracks_for(pattern)
+	return all[0] if not all.is_empty() else {}
 
-## Every track that plays [param pattern].
+## Every track that plays [param pattern], directly (by object, then by file) or
+## as a step of the chain it plays, direct ones first.
 func tracks_for(pattern: MusicPattern) -> Array:
 	var out: Array = []
+	if pattern == null:
+		return out
 	var path := path_of(pattern)
 	for t in tracks:
 		if t["pattern"] == pattern or (path != "" and t["pattern_path"] == path):
 			out.append(t)
+	for t in tracks:
+		if not out.has(t) and contains(t["pattern"], pattern):
+			out.append(t)
 	return out
+
+## True when [param whole] is a chain that has [param part] (or the pattern in
+## the same file) among its steps, at any depth.
+static func contains(whole: MusicPattern, part: MusicPattern, _stack: Array = []) -> bool:
+	var chain := whole as PatternChain
+	if chain == null or part == null or _stack.has(chain):
+		return false
+	_stack.append(chain)
+	var path := path_of(part)
+	for step in chain.steps:
+		var p: MusicPattern = step.pattern if step != null else null
+		if p == null:
+			continue
+		if p == part or (path != "" and path_of(p) == path) or contains(p, part, _stack):
+			_stack.pop_back()
+			return true
+	_stack.pop_back()
+	return false
 
 ## The root of the scene at [param path] if it is open in the editor, else null.
 static func find_open_root(path: String) -> Node:
@@ -128,16 +147,60 @@ static func node_for(root: Node, track_name: String) -> Node:
 		return root
 	return n
 
-## True when [param p] is marked with a type of its own and a track of
-## [param track_type] plays it as another (the game goes by the track).
-static func clash(p: MusicPattern, track_type: int) -> bool:
-	return p != null and int(p.editor_track_type) != MusicPattern.EditorTrackType.AUTO \
-			and int(p.editor_track_type) != track_type
+## The explicit types [param p] is marked with: its own, then (for a chain) those
+## of its steps' patterns, depth first. Empty when everything is Auto.
+static func hints(p: MusicPattern, _stack: Array = []) -> Array[int]:
+	var out: Array[int] = []
+	if p == null or _stack.has(p):
+		return out
+	if int(p.editor_track_type) != MusicPattern.EditorTrackType.AUTO:
+		out.append(int(p.editor_track_type))
+	var chain := p as PatternChain
+	if chain != null:
+		_stack.append(chain)
+		for step in chain.steps:
+			if step != null:
+				out.append_array(hints(step.pattern, _stack))
+		_stack.pop_back()
+	return out
 
-## The warning for a [method clash], or "".
+## The type Match pattern sets a track to: the pattern's own mark, or for a chain
+## that is Auto the first mark among its steps. Auto (-1) when nothing is marked.
+static func match_type(p: MusicPattern) -> int:
+	var h := hints(p)
+	return h[0] if not h.is_empty() else int(MusicPattern.EditorTrackType.AUTO)
+
+## True when [param p] is marked with a type of its own and a track of
+## [param track_type] plays it as another (the game goes by the track). A chain
+## clashes when ANY mark in it, its own or a step's, differs from the track's.
+static func clash(p: MusicPattern, track_type: int) -> bool:
+	for h in hints(p):
+		if h != track_type:
+			return true
+	return false
+
+## The warning for a [method clash], or "". For a chain it names the first step
+## whose mark differs, unless the chain's own does.
 static func clash_text(p: MusicPattern, track_type: int) -> String:
 	if not clash(p, track_type):
 		return ""
 	var as_track := SynthPitchMap.type_name(track_type)
+	var own := int(p.editor_track_type)
+	var chain := p as PatternChain
+	if chain != null and (own == MusicPattern.EditorTrackType.AUTO or own == track_type):
+		for i in chain.steps.size():
+			var step := chain.steps[i]
+			if step != null and clash(step.pattern, track_type):
+				return "Step %d (%s) is marked %s but this track plays it as %s: the game plays it as %s." % [
+						i + 1, pattern_name(step.pattern), SynthPitchMap.type_name(match_type(step.pattern)), as_track, as_track]
 	return "The pattern is marked %s but this track plays it as %s: the game plays it as %s." % [
-			SynthPitchMap.type_name(int(p.editor_track_type)), as_track, as_track]
+			SynthPitchMap.type_name(own), as_track, as_track]
+
+## A pattern's name for labels: its resource_name, else its file, else "(inline)".
+static func pattern_name(p: Resource) -> String:
+	if p == null:
+		return "(none)"
+	if p.resource_name != "":
+		return p.resource_name
+	var path := path_of(p)
+	return path.get_file() if path != "" else "(inline)"

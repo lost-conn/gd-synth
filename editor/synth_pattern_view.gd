@@ -704,12 +704,12 @@ func _clashes() -> Array:
 	return out
 
 func _clash_text(list: Array) -> String:
-	var marked := SynthPitchMap.type_name(int(pattern.editor_track_type))
+	var marked := SynthPitchMap.type_name(SynthSongContext.match_type(pattern))
 	if list.size() == 1:
 		var t: Dictionary = list[0]["track"]
 		var as_track := SynthPitchMap.type_name(int(t["type"]))
-		return "The pattern is marked %s but MusicTrack \"%s\" in %s plays it as %s: the game plays it as %s." % [
-				marked, t["name"], _scene_name(list[0]["ctx"]), as_track, as_track]
+		return "The %s is marked %s but MusicTrack \"%s\" in %s plays it as %s: the game plays it as %s." % [
+				"chain or a step" if pattern is PatternChain else "pattern", marked, t["name"], _scene_name(list[0]["ctx"]), as_track, as_track]
 	var lines := PackedStringArray()
 	for e in list:
 		lines.append("%s in %s: %s" % [e["track"]["name"], _scene_name(e["ctx"]), SynthPitchMap.type_name(int(e["track"]["type"]))])
@@ -737,7 +737,7 @@ func _refresh_clash() -> void:
 		_match_btn.tooltip_text = "%s\n\n%s is not open in the editor, so its tracks are read-only. Open the scene to edit them." % [text, closed]
 	else:
 		_match_btn.tooltip_text = "%s\n\nSet %s to %s (undoable)." % [text,
-				"the track" if list.size() == 1 else "these tracks", SynthPitchMap.type_name(int(pattern.editor_track_type))]
+				"the track" if list.size() == 1 else "these tracks", SynthPitchMap.type_name(SynthSongContext.match_type(pattern))]
 
 func _on_match_pressed() -> void:
 	if pattern == null or _match_btn.disabled:
@@ -749,7 +749,7 @@ func _on_match_pressed() -> void:
 			by_scene[ctx.scene_path] = []
 		by_scene[ctx.scene_path].append(e["track"]["name"])
 	for scene in by_scene:
-		match_tracks_requested.emit(scene, by_scene[scene], int(pattern.editor_track_type))
+		match_tracks_requested.emit(scene, by_scene[scene], SynthSongContext.match_type(pattern))
 	refresh_tracks()
 
 # A context the Track view announced (or the one found for this pattern) replaces
@@ -839,7 +839,8 @@ func _refresh_faint() -> void:
 		var pat: MusicPattern = t["pattern"]
 		var color: Color = FAINT_COLORS[i % FAINT_COLORS.size()]
 		i += 1
-		if pat == null or pat == pattern or (current_path != "" and t["pattern_path"] == current_path):
+		if pat == null or pat == pattern or (current_path != "" and t["pattern_path"] == current_path) \
+				or SynthSongContext.contains(pat, pattern):
 			continue
 		var plen := maxf(pat.get_play_length(), 0.25)
 		var list: Array = []
