@@ -22,11 +22,25 @@ extends Node
 # row of the pattern is routed to the kit piece that owns that row, and piece i
 # plays on channel synth_channel + i with its own patch, pitch, gain and pan.
 #
+# Mute: set_muted() silences a track at runtime while it keeps its place (see there).
+#
 # SFX overrides:
 #   bpm_override > 0         — use own local clock at that BPM (ignore director)
 #   key_override != null     — resolve pitches against this block (ignore director)
 
 enum TrackType { CHORD, MELODY, DRUM }
+
+## When a [method set_muted] change takes effect, on the director's beat clock
+## (the track's own clock with [member bpm_override]).
+##   NOW        — at once
+##   NEXT_BEAT  — on the next whole beat
+##   NEXT_BAR   — at the next bar line: [member MusicSong.beats_per_bar] counted
+##                from the song section's start while a [MusicDataPlayer] song
+##                drives this track, else every 4 beats from beat 0
+##   NEXT_BLOCK — at the next chord change of the director's progression (with
+##                [member bpm_override] there is no progression: at once)
+## A beat that is already the current one counts as the next.
+enum MuteTiming { NOW, NEXT_BEAT, NEXT_BAR, NEXT_BLOCK }
 
 @export var track_type: TrackType = TrackType.CHORD
 
@@ -156,6 +170,19 @@ var _pending_bends: Array = []
 # Counter for play_once() to invalidate stale deferred deactivates when
 # the same track is re-triggered rapidly.
 var _play_once_token: int = 0
+# See set_muted(). A muted track advances like any other (cursor, chain steps,
+# song restarts) and just plays no notes; nothing else in this script resets it.
+var _muted: bool = false
+# A change that takes effect on _mute_pending_beat (effective beats): notes due at
+# or after that beat get _mute_pending_value, earlier ones still the current state.
+var _mute_pending: bool = false
+var _mute_pending_value: bool = false
+var _mute_pending_beat: float = INF
+# The MusicDataPlayer whose song drives this track (set by it), for NEXT_BAR.
+var _song_player: Node = null
+# Tolerance, in beats, when comparing a note's beat with a mute change's: block
+# and section starts are sums of floats and can differ in the last digits.
+const MUTE_EPS := 0.0005
 
 # ---------------------------------------------------------------------------
 # Lifecycle
@@ -228,6 +255,44 @@ func deactivate() -> void:
 ## Whether this track is currently activated (playing or pending start).
 func is_active() -> bool:
 	return _active
+
+## Mute or unmute the track at runtime, [param at] the director's beat clock says
+## (see [enum MuteTiming]). A muted track keeps advancing exactly as if it were
+## playing — its pattern cursor, chain steps and the restarts a song section
+## gives it — but plays no notes and no bends, so unmuting resumes in phase with
+## nothing restarted. Muting releases the notes held at that moment, as
+## [method deactivate] does. A change at a future beat applies per note: notes due
+## on or after that beat get the new state (the note on the beat itself too),
+## earlier ones the old; a later call replaces a pending one, and a call that
+## asks for the state the track already has cancels it. The mute is independent of
+## [method activate] / [method deactivate], [method swap_pattern],
+## [method start_pattern_at] and the song player's slots, and the sample bake
+## ignores it. Kit tracks mute every piece. With no running director clock
+## ([member MusicDirector.playing] false) the change applies at once.
+func set_muted(muted: bool, at: MuteTiming = MuteTiming.NOW) -> void:
+	var beat: float = _mute_change_beat(at)
+	if is_nan(beat):
+		_mute_pending = false
+		_apply_mute(muted)
+		return
+	if muted == _muted:
+		_mute_pending = false  # already so: drop a change that would undo it
+		return
+	_mute_pending = true
+	_mute_pending_value = muted
+	_mute_pending_beat = beat
+
+## Whether the track is muted now (a change set for a later beat is not counted
+## until that beat has been played).
+func is_muted() -> bool:
+	return _muted
+
+## The change waiting for its beat: {"muted": bool, "beat": float} (the beat on
+## the clock the track runs on), or an empty dictionary.
+func get_pending_mute() -> Dictionary:
+	if not _mute_pending:
+		return {}
+	return {"muted": _mute_pending_value, "beat": _mute_pending_beat}
 
 ## SFX-style one-shot: activate, await one full pattern length, then
 ## deactivate. Idempotent under rapid re-trigger — only the most recent
@@ -401,11 +466,65 @@ func _configure_bus() -> void:
 	synth.ensure_channel_bus(synth_channel, effects, output_bus)
 
 # ---------------------------------------------------------------------------
+# Mute
+# ---------------------------------------------------------------------------
+
+## [MusicDataPlayer] calls this on the tracks its song drives (null when it lets
+## go), so a NEXT_BAR mute counts bars the way the song does.
+func set_song_player(player: Node) -> void:
+	_song_player = player
+
+# The effective beat a change with timing [param at] takes effect on, or NAN for
+# "at once".
+func _mute_change_beat(at: MuteTiming) -> float:
+	if at == MuteTiming.NOW:
+		return NAN
+	if bpm_override <= 0.0 and (director == null or not director.playing):
+		return NAN
+	var effective: float = _effective_beats()
+	match at:
+		MuteTiming.NEXT_BEAT:
+			return ceilf(effective - MUTE_EPS)
+		MuteTiming.NEXT_BAR:
+			if bpm_override <= 0.0 and _song_player != null and is_instance_valid(_song_player) \
+					and _song_player.has_method("get_bar_beat_at_or_after"):
+				var bar: float = _song_player.get_bar_beat_at_or_after(effective - MUTE_EPS)
+				if not is_nan(bar):
+					return bar
+			return ceilf((effective - MUTE_EPS) / 4.0) * 4.0
+		MuteTiming.NEXT_BLOCK:
+			return _next_block_start_effective(effective)
+	return NAN
+
+func _apply_mute(muted: bool) -> void:
+	if muted == _muted:
+		return
+	_muted = muted
+	if muted:
+		_release_all()
+
+# Apply a pending change once the clock has played up to its beat.
+func _settle_mute(effective: float) -> void:
+	if _mute_pending and effective >= _mute_pending_beat - MUTE_EPS:
+		_mute_pending = false
+		_apply_mute(_mute_pending_value)
+
+# Whether a note that sounds at effective beat [param at] is muted.
+func _muted_at(at: float) -> bool:
+	if _mute_pending and at >= _mute_pending_beat - MUTE_EPS:
+		return _mute_pending_value
+	return _muted
+
+# ---------------------------------------------------------------------------
 # Per-frame render
 # ---------------------------------------------------------------------------
 
 func _process(delta: float) -> void:
-	if synth == null or director == null or not _active:
+	if synth == null or director == null:
+		return
+	if not _active:
+		if _mute_pending:
+			_settle_mute(_effective_beats())
 		return
 
 	var using_override: bool = bpm_override > 0.0
@@ -434,7 +553,6 @@ func _process(delta: float) -> void:
 
 # Play what is due up to [param effective]: note-offs, bends, pattern notes.
 func _advance(effective: float) -> void:
-	var using_override: bool = bpm_override > 0.0
 	_scanned_to = effective
 
 	# Release note-offs whose time has come.
@@ -463,6 +581,13 @@ func _advance(effective: float) -> void:
 				_pending_bends.remove_at(bi)
 			bi -= 1
 
+	_play_due_notes(effective)
+	_settle_mute(effective)
+
+# The pattern notes due up to [param effective], except the muted ones (the
+# cursor moves on either way).
+func _play_due_notes(effective: float) -> void:
+	var using_override: bool = bpm_override > 0.0
 	if pattern == null:
 		return
 	var play_notes: Array[PatternNote] = pattern.get_play_notes()
@@ -478,6 +603,8 @@ func _advance(effective: float) -> void:
 		return
 	var cursor: float = fposmod(relative, length)
 	var wrapped: bool = cursor < _prev_cursor - 0.001
+	var cycle_start: float = effective - cursor
+	var gate: bool = _muted or _mute_pending
 
 	for note in play_notes:
 		var note_beat: float = note.beat
@@ -490,6 +617,13 @@ func _advance(effective: float) -> void:
 		else:
 			should_trigger = swung > _prev_cursor and swung <= cursor
 		if should_trigger:
+			if gate:
+				# The beat the note sounds on: this cycle's, or the one that just ended.
+				var at: float = cycle_start + swung
+				if wrapped and swung > cursor:
+					at -= length
+				if _muted_at(at):
+					continue
 			_trigger_note(note, effective)
 
 	_prev_cursor = cursor

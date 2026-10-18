@@ -288,6 +288,33 @@ func get_section_length() -> float:
 func is_song_playing() -> bool:
 	return _song_active and director != null and director.playing
 
+## Mute or unmute the tracks called [param names] (node names, as a section slot
+## names them: this node's descendants first, then the tracks wired to the
+## director), see [method MusicTrack.set_muted]. Works with or without a song.
+## Returns how many of the names were found. A muted track keeps playing along
+## silently, so a song section that restarts it still does, and unmuting at a
+## chosen beat brings it in exactly in phase.
+func set_tracks_muted(names: Array, muted: bool, at: MusicTrack.MuteTiming = MusicTrack.MuteTiming.NOW) -> int:
+	var found: int = 0
+	for track_name in names:
+		var t := _lookup_track(StringName(track_name))
+		if t == null:
+			continue
+		found += 1
+		t.set_muted(muted, at)
+	return found
+
+## The first bar line at or after [param beat] of the playing song: bars of
+## [member MusicSong.beats_per_bar] counted from the current section's start, and
+## the section's end if that comes first (it is a bar line too). NAN when no song
+## plays. [method MusicTrack.set_muted] uses it for NEXT_BAR.
+func get_bar_beat_at_or_after(beat: float) -> float:
+	if not _song_active or song == null:
+		return NAN
+	var bpb: float = float(maxi(1, song.beats_per_bar))
+	var bar: float = _section_start + ceilf((beat - _section_start) / bpb) * bpb
+	return minf(bar, _section_start + _section_len)
+
 # ---------------------------------------------------------------------------
 # Song internals
 # ---------------------------------------------------------------------------
@@ -336,6 +363,8 @@ func _end_song(restore: bool = false) -> void:
 	_song_active = false
 	_queued = null
 	_queue_at = INF
+	for t in _own_tracks():
+		t.set_song_player(null)
 	if restore:
 		for t in _own_tracks():
 			var own: Dictionary = _own[t]
@@ -539,6 +568,7 @@ func _on_director_seeked() -> void:
 # --- Tracks ------------------------------------------------------------------
 
 func _remember(t: MusicTrack) -> void:
+	t.set_song_player(self)
 	if not _own.has(t):
 		_own[t] = {"pattern": t.pattern, "active": t.is_active()}
 
@@ -578,16 +608,21 @@ func _collect_tracks(n: Node, out: Array) -> void:
 		_collect_tracks(c, out)
 
 func _find_track(track_name: StringName) -> MusicTrack:
+	var t := _lookup_track(track_name)
+	if t != null:
+		_remember(t)
+	return t
+
+# The track called [param track_name], without taking over its state.
+func _lookup_track(track_name: StringName) -> MusicTrack:
 	var own: Array = []
 	_collect_tracks(self, own)
 	for t in own:
 		if t.name == track_name:
-			_remember(t)
 			return t
 	if director != null:
 		for t in director.get_tracks():
 			if t is MusicTrack and t.name == track_name:
-				_remember(t)
 				return t
 	return null
 

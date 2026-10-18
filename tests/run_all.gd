@@ -9,7 +9,7 @@ extends SceneTree
 # Arguments after "--" pick files by name: ... run_all.gd -- smoke song_view
 
 const DIR := "res://addons/godot_synth/tests/"
-const FILES := ["test_smoke.gd", "test_song_view.gd"]
+const FILES := ["test_smoke.gd", "test_song_view.gd", "test_mute.gd"]
 # A test that has not finished in this many seconds has hung (a script error aborts
 # its coroutine and nothing else would end the run).
 const TIMEOUT := 120.0
