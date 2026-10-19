@@ -63,6 +63,13 @@ var _boundary_beat: float = INF
 # MusicTracks wired to this director (see register_track()).
 var _tracks: Array = []
 
+## Longest frame the beat clock advances by, in seconds. A longer frame is the
+## main thread having stalled (a level loading, a shader compiling) or the page
+## having been hidden: the clock waits it out instead of jumping ahead, which
+## would fire every note of the gap at once when it is over. SynthSampler's own
+## clock is capped at the same length.
+const MAX_FRAME := 0.25
+
 # ---------------------------------------------------------------------------
 # Playback control
 # ---------------------------------------------------------------------------
@@ -269,7 +276,7 @@ func _process(delta: float) -> void:
 	if not playing or data == null or data.blocks.is_empty():
 		return
 	var beats_per_sec: float = get_bpm() / 60.0
-	var delta_beats: float = delta * beats_per_sec
+	var delta_beats: float = minf(delta, MAX_FRAME) * beats_per_sec
 	_beat_in_block += delta_beats
 	_total_beats += delta_beats
 

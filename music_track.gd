@@ -547,7 +547,8 @@ func _process(delta: float) -> void:
 		_sync_cursor_to_now()
 
 	if using_override:
-		_local_time += delta
+		# Capped as the director's clock is (see MusicDirector.MAX_FRAME).
+		_local_time += minf(delta, MusicDirector.MAX_FRAME)
 
 	_advance(_effective_beats())
 
